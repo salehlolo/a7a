@@ -397,8 +397,17 @@ class FuturesExchange:
                 print("[WARN] create_order returned no id:", o)
                 return None
             return o
+        except ccxt.InsufficientFunds:
+            bal = self.get_balance_usdt()
+            print(f"[WARN] insufficient USDT margin: available {bal:.2f} — skipping order for {symbol}")
+            return None
         except Exception as e:
-            print("[WARN] create_order failed:", e)
+            msg = str(e)
+            if "Insufficient" in msg and "margin" in msg:
+                bal = self.get_balance_usdt()
+                print(f"[WARN] insufficient USDT margin ({bal:.2f} available): {msg}")
+            else:
+                print("[WARN] create_order failed:", msg)
             return None
 
     def close_position(self, symbol: str, orig_side: str, contract_amt: float):
