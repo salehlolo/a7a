@@ -30,14 +30,6 @@ import ta
 import requests
 
 # =========================
-# Constants
-# =========================
-
-# Each trade uses 90% of the account balance at 10× leverage
-LEVERAGE = 10
-BALANCE_FRACTION = 0.9
-
-# =========================
 # Helpers
 # =========================
 
@@ -61,6 +53,29 @@ def safe_float(x, default=np.nan):
 def pct(n): return f"{n*100:.2f}%"
 
 # =========================
+# Capital/Leverage Helpers
+# =========================
+
+def _count_open_trades(open_trades) -> int:
+    try:
+        return max(0, int(len(open_trades or [])))
+    except Exception:
+        return 0
+
+def _used_capital_usdt(open_trades) -> float:
+    """Compute total notional (USDT) across open trades."""
+    tot = 0.0
+    for t in (open_trades or []):
+        try:
+            if isinstance(t, dict):
+                tot += float(t.get("notional", 0.0))
+            else:
+                tot += float(getattr(t, "notional", 0.0))
+        except Exception:
+            pass
+    return tot
+
+# =========================
 # Config
 # =========================
 
@@ -68,6 +83,15 @@ def pct(n): return f"{n*100:.2f}%"
 class Config:
     timeframe: str = "30m"
     lookback: int = 300
+
+    # === Capital & Leverage Control (defaults per your request) ===
+    leverage_x: float = 15.0          # الرافعة المالية (X)
+    capital_pct: float = 1.0          # نسبة رأس المال المستخدمة إجمالًا (1.0 = 100%)
+    max_open_trades: int = 3          # الحد الأقصى للصفقات المتزامنة
+    equal_split_mode: bool = False    # تقسيم ثابت (True) أم ديناميكي (False)
+    dynamic_split_mode: bool = True   # تقسيم ديناميكي للمتبقي على الخانات المتبقية
+    min_notional: float = 10.0        # حد أدنى للقيمة الإسمية للصفقة
+    max_notional: float = 1_000_000.0 # حد أقصى للقيمة الإسمية (أمان)
 
     # Indicators / windows
     ema_fast: int = 9
@@ -122,9 +146,6 @@ class Config:
     scalp_tp_atr_mult: float = 1.2
     scalp_sl_atr_mult: float = 0.8
     debug_signals: bool = True   # كان False، فعّله افتراضيًا للتشخيص
-
-    # Sizing
-    max_open_trades: int = 1
 
     # Filters
     funding_filter: bool = True
@@ -255,7 +276,7 @@ class FuturesExchange:
         # Determine account modes for proper order parameters
         self.pos_mode = "net"        # "net" أو "long_short"
         self.margin_mode = "cross"   # "cross" أو "isolated"
-        self.leverage = LEVERAGE
+        self.leverage = float(cfg.leverage_x)
         try:
             info = self.x.privateGetAccountConfig()
             data = info.get("data", [])
@@ -719,6 +740,7 @@ class PaperTrade:
     tp: float
     model: str
     qty: float
+    notional: float
     status: str = "open"
     exit_price: Optional[float] = None
     exit_time: Optional[str] = None
@@ -754,10 +776,12 @@ class Paper:
 
     def _gen_id(self) -> str: return f"T{int(time.time()*1000)}"
 
-    def open_virtual(self, symbol: str, price: float, sig: Signal, qty: float, cfg: Config) -> PaperTrade:
+    def open_virtual(self, symbol: str, price: float, sig: Signal, qty: float,
+                     notional: float, cfg: Config) -> PaperTrade:
         t = PaperTrade(
             id=self._gen_id(), timestamp=fmt_ts(), symbol=symbol, timeframe=cfg.timeframe,
-            side=sig.side, entry=price, sl=float(sig.sl), tp=float(sig.tp), model=sig.model, qty=qty
+            side=sig.side, entry=price, sl=float(sig.sl), tp=float(sig.tp),
+            model=sig.model, qty=qty, notional=notional
         )
         self.open[t.id] = t
         return t
@@ -1257,23 +1281,55 @@ class Bot:
                     if (now_utc() - self.last_time[symbol]).total_seconds()/60.0 < self.cfg.min_minutes_between_same_signal:
                         continue
 
-                bal = self.ex.get_balance_usdt()
-                notional_ref = bal * BALANCE_FRACTION * LEVERAGE
-                if notional_ref <= 0:
-                    print(f"[WARN] skipping {symbol}: balance {bal:.2f} USDT is too low")
+                bal = float(self.ex.get_balance_usdt())
+                lev = max(1.0, float(self.cfg.leverage_x))
+                max_slots = max(1, int(self.cfg.max_open_trades))
+
+                total_capital = bal * float(self.cfg.capital_pct)
+                open_trades = list(self.paper.open.values())
+                open_cnt = _count_open_trades(open_trades)
+                used_capital = _used_capital_usdt(open_trades)
+                remaining_slots = max(1, max_slots - open_cnt)
+
+                if self.cfg.equal_split_mode and not self.cfg.dynamic_split_mode:
+                    per_trade_capital = total_capital / max_slots
+                else:
+                    rem_cap = max(0.0, total_capital - used_capital)
+                    per_trade_capital = rem_cap / remaining_slots if remaining_slots > 0 else 0.0
+
+                target_notional = max(0.0, per_trade_capital) * lev
+                target_notional = max(float(self.cfg.min_notional),
+                                      min(float(self.cfg.max_notional), target_notional))
+
+                mkt = self.ex.x.market(symbol)
+                contract_size = float(mkt.get("contractSize") or 1.0)
+                base_qty = target_notional / price
+                contract_qty = base_qty / contract_size
+                try:
+                    contract_qty = float(self.ex.x.amount_to_precision(symbol, contract_qty))
+                except Exception:
+                    contract_qty = float(contract_qty)
+
+                min_amt = float(((mkt.get("limits") or {}).get("amount") or {}).get("min") or 0.0)
+                if contract_qty < max(1e-9, min_amt):
+                    print(f"[WARN] {symbol} contract_qty < {max(1e-9, min_amt)} after precision — skipping")
                     continue
 
-                base_qty = notional_ref / price
-                mkt = self.ex.x.market(symbol)
-                contract_size = float(mkt.get("contractSize") or 1)
-                contract_qty = base_qty / contract_size
-                contract_qty = float(self.ex.x.amount_to_precision(symbol, contract_qty))
-                base_qty = contract_qty * contract_size
-                notional_ref = base_qty * price
-                req_margin = notional_ref / LEVERAGE
-                if bal < req_margin:
-                    print(f"[WARN] skipping {symbol}: need {req_margin:.2f} USDT but only {bal:.2f} available")
+                notional = contract_qty * contract_size * float(price)
+                req_margin = notional / lev
+                if req_margin > bal:
+                    print(f"[WARN] insufficient USDT margin: need {req_margin:.2f} > available {bal:.2f} — skipping {symbol}")
                     continue
+
+                if self.cfg.debug_signals:
+                    print(f"[RISK] {symbol} open={open_cnt}/{max_slots} rem_slots={remaining_slots} "
+                          f"used_cap={used_capital:.2f} total_cap={total_capital:.2f} "
+                          f"per_cap={per_trade_capital:.2f} lev={lev:.1f} "
+                          f"target_notional={target_notional:.2f} req_margin={req_margin:.2f} "
+                          f"contracts={contract_qty:.6f}")
+
+                base_qty = contract_qty * contract_size
+                notional_ref = notional
                 risk = abs(price - sig.sl); reward = abs(sig.tp - price)
                 rr = round(reward / risk, 2) if risk > 0 else None
 
@@ -1302,7 +1358,7 @@ class Bot:
                     self.last_time[symbol] = now_utc()
                     continue
 
-                t = self.paper.open_virtual(symbol, price, sig, base_qty, self.cfg)
+                t = self.paper.open_virtual(symbol, price, sig, base_qty, notional, self.cfg)
                 self.paper.ml_snapshot(t.id, symbol, row, regime)
 
                 self.last_key[symbol] = key
@@ -1325,6 +1381,15 @@ def parse_args() -> Config:
     p.add_argument("--quiet", nargs="*", default=None, help="UTC HH:MM times to avoid (e.g., 12:30 18:00)")
     p.add_argument("--top", type=int, default=None, help="Top N USDT perpetuals to scan (override config)")
     p.add_argument("--live", action="store_true", help="Use real trading environment instead of OKX demo")
+
+    # === CLI overrides for capital/leverage tool ===
+    p.add_argument("--leverage-x", type=float, default=None, help="set leverage X (e.g., 15)")
+    p.add_argument("--capital-pct", type=float, default=None, help="fraction of balance to use (1.0 = 100%)")
+    p.add_argument("--max-open-trades", type=int, default=None, help="max concurrent trades (e.g., 3)")
+    p.add_argument("--equal-split", action="store_true", help="use equal split: total/slots")
+    p.add_argument("--dynamic-split", action="store_true", help="use dynamic split of remaining capital")
+    p.add_argument("--min-notional", type=float, default=None)
+    p.add_argument("--max-notional", type=float, default=None)
     args = p.parse_args()
     cfg = Config()
     cfg.timeframe = args.timeframe
@@ -1335,6 +1400,17 @@ def parse_args() -> Config:
         cfg.debug_signals = False
     if args.no_funding_filter:
         cfg.funding_filter = False
+    # apply CLI overrides
+    if args.leverage_x is not None:       cfg.leverage_x = float(args.leverage_x)
+    if args.capital_pct is not None:      cfg.capital_pct = float(args.capital_pct)
+    if args.max_open_trades is not None:  cfg.max_open_trades = int(args.max_open_trades)
+    if args.equal_split:
+        cfg.equal_split_mode = True
+        cfg.dynamic_split_mode = False
+    if args.dynamic_split:
+        cfg.dynamic_split_mode = True
+    if args.min_notional is not None:     cfg.min_notional = float(args.min_notional)
+    if args.max_notional is not None:     cfg.max_notional = float(args.max_notional)
     # اسمح بتجاوز الإعدادات من سطر الأوامر
     if args.top is not None:
         cfg.top_n_symbols = int(args.top)
