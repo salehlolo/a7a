@@ -67,7 +67,7 @@ def pct(n): return f"{n*100:.2f}%"
 @dataclass
 class Config:
     timeframe: str = "30m"
-    lookback: int = 800
+    lookback: int = 300
 
     # Indicators / windows
     ema_fast: int = 9
@@ -324,6 +324,37 @@ class FuturesExchange:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         return df.dropna()
 
+    def fetch_ohlcv_paged(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+        """
+        Fetch OHLCV data in multiple requests to bypass the 300-candle limit on OKX.
+        Useful for demo accounts that enforce a per-call maximum.
+        """
+        max_per_call = 300
+        out = []
+        since = None
+        remaining = int(limit)
+        while remaining > 0:
+            batch = min(remaining, max_per_call)
+            try:
+                ohlcv = self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=batch, since=since)
+            except Exception:
+                break
+            if not ohlcv:
+                break
+            out.extend(ohlcv)
+            if len(ohlcv) < batch:
+                break
+            last_ts = int(ohlcv[-1][0])
+            since = last_ts + 1
+            remaining -= len(ohlcv)
+            time.sleep(0.05)
+        if not out:
+            return pd.DataFrame(columns=["open","high","low","close","volume"]).astype(float)
+        df = pd.DataFrame(out, columns=["timestamp","open","high","low","close","volume"])
+        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df = df.set_index("datetime").drop(columns=["timestamp"]).apply(pd.to_numeric, errors="coerce").dropna()
+        return df.sort_index()
+
     def fetch_ticker_price(self, symbol: str) -> Optional[float]:
         """Fetch the latest trade price for a symbol."""
         try:
@@ -433,7 +464,7 @@ class FuturesExchange:
             if nowt - last_ok < self.cfg.health_refresh_minutes*60:
                 ok.append(s); continue
             try:
-                _ = self.fetch_ohlcv(s, self.cfg.timeframe, limit=self.cfg.lookback)
+                _ = self.fetch_ohlcv_paged(s, self.cfg.timeframe, limit=self.cfg.lookback)
                 if _.shape[0] >= self.cfg.lookback:
                     ok.append(s)
                     self._health_cache[s] = nowt
@@ -1034,7 +1065,7 @@ class Bot:
         # تحديث إغلاقات الصفقات (حتى أثناء الوقف/التهدئة)
         for symbol in self.symbols:
             try:
-                df = self.ex.fetch_ohlcv(symbol, self.cfg.timeframe, limit=self.cfg.lookback)
+                df = self.ex.fetch_ohlcv_paged(symbol, self.cfg.timeframe, limit=self.cfg.lookback)
                 if len(df) < self.cfg.lookback:
                     print(
                         f"[WARN] insufficient OHLCV for {symbol}: "
@@ -1119,7 +1150,7 @@ class Bot:
         for symbol in self.symbols:
             try:
 
-                df = self.ex.fetch_ohlcv(symbol, self.cfg.timeframe, limit=self.cfg.lookback)
+                df = self.ex.fetch_ohlcv_paged(symbol, self.cfg.timeframe, limit=self.cfg.lookback)
                 if len(df) < self.cfg.lookback:
                     print(
                         f"[WARN] insufficient OHLCV for {symbol}: "
@@ -1224,6 +1255,7 @@ class Bot:
 def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Evolving Committee Scalper (Alerts Only) — No OpenAI")
     p.add_argument("--timeframe", default="30m")
+    p.add_argument("--lookback", type=int, default=None)
     p.add_argument("--quiet", nargs="*", default=None, help="UTC HH:MM times to avoid (e.g., 12:30 18:00)")
     p.add_argument("--top", type=int, default=None, help="Top N USDT perpetuals to scan (override config)")
     p.add_argument("--live", action="store_true", help="Use real trading environment instead of OKX demo")
@@ -1231,6 +1263,8 @@ def parse_args() -> Config:
     cfg = Config()
     cfg.timeframe = args.timeframe
     cfg.okx_demo = not args.live
+    if args.lookback is not None:
+        cfg.lookback = int(args.lookback)
     # اسمح بتجاوز الإعدادات من سطر الأوامر
     if args.top is not None: cfg.top_n_symbols = int(args.top)
     if args.quiet is not None: cfg.quiet_windows_utc = tuple(args.quiet)
