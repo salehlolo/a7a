@@ -99,6 +99,12 @@ class Config:
     min_atr_pct: float = 0.15          # كان 0.20 → لِين بسيط
     min_vol_z: float = 0.20            # كان 0.50 → يسمح بسيولة متوسطة
     min_vol_pct_alt: float = 0.40      # حد بديل: الحجم ضمن أعلى 40% من نطاقه المحلي
+    # أوضاع الفلترة: strict | any | kofn | soft
+    filter_mode: str = "kofn"          # الافتراضي: 2 من 3 يمرّ
+    filters_k: int = 2                 # k-of-n
+    # لـ soft: تصغير/تكبير حجم الصفقة بدل الحظر
+    soft_scale_low: float = 0.70
+    soft_scale_high: float = 1.00
     quality_sizing: bool = True        # ربط الحجم بجودة الإشارة
     min_quality: float = 0.35          # أقل جودة مسموح بها
     size_scale_low: float = 0.60       # معامل التصغير عند الجودة الدنيا المقبولة
@@ -598,6 +604,56 @@ def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     d = d.replace([np.inf, -np.inf], np.nan).dropna()
     return d
 
+# =============== Filters Engine (k-of-n / soft) ===============
+def eval_filters(side: str, row: pd.Series, cfg: Config,
+                 px: float, bb_lo: float, bb_hi: float, rsi: float) -> Tuple[bool, Dict[str, bool], float]:
+    """Evaluate liquidity, ATR and trend filters.
+
+    Returns:
+        passed (bool): decision for strict/any/kofn (always True for soft)
+        mask (dict): individual results for liq/atr/trend
+        score (float): fraction of passed filters, used for soft scaling
+    """
+    vol_z = float(row.get("vol_z", -10.0))
+    vol_pct = float(row.get("vol_pct", -1.0))
+    pass_liq = (vol_z >= cfg.min_vol_z) or (vol_pct >= cfg.min_vol_pct_alt)
+
+    atr_pct = float(row.get("atr_pct", 0.0))
+    pass_atr = atr_pct >= cfg.min_atr_pct
+
+    ema_fast = float(row.get("ema_fast", np.nan))
+    ema_slow = float(row.get("ema_slow", np.nan))
+    pass_trend = True
+    if cfg.trend_filter:
+        band_w = max(1e-9, float(bb_hi - bb_lo))
+        touch_buy = float(np.clip((bb_lo + 0.10 * band_w - px) / band_w, 0.0, 1.0))
+        touch_sell = float(np.clip((px - (bb_hi - 0.10 * band_w)) / band_w, 0.0, 1.0))
+        rsi_buy_extreme = rsi <= max(25.0, getattr(cfg, "scalp_rsi_buy", 40.0) - 5.0)
+        rsi_sell_extreme = rsi >= min(75.0, getattr(cfg, "scalp_rsi_sell", 60.0) + 5.0)
+        allow_ct_buy = rsi_buy_extreme and (touch_buy >= 0.25)
+        allow_ct_sell = rsi_sell_extreme and (touch_sell >= 0.25)
+        if side == "BUY":
+            pass_trend = (ema_fast > ema_slow) or allow_ct_buy
+        else:
+            pass_trend = (ema_fast < ema_slow) or allow_ct_sell
+
+    mask = {"liq": pass_liq, "atr": pass_atr, "trend": pass_trend}
+    n_pass = sum(1 for v in mask.values() if v)
+    n_total = len(mask)
+    score = n_pass / n_total if n_total else 0.0
+
+    mode = (cfg.filter_mode or "kofn").lower()
+    if mode == "strict":
+        return (n_pass == n_total, mask, score)
+    if mode == "any":
+        return (n_pass >= 1, mask, score)
+    if mode == "kofn":
+        k = max(1, int(cfg.filters_k))
+        return (n_pass >= k, mask, score)
+    if mode == "soft":
+        return (True, mask, score)
+    return (n_pass == n_total, mask, score)
+
 # =========================
 # Quality Scoring
 # =========================
@@ -735,8 +791,8 @@ def strat(df: pd.DataFrame):
 # SCALP strategy (BB + RSI)
 # =========================
 
-def sig_scalp(symbol: str, row: pd.Series, cfg: Config) -> Optional[Tuple[str, str, float]]:
-    """SCALP logic مع فلاتر الجودة."""
+def sig_scalp(symbol: str, row: pd.Series, cfg: Config) -> Optional[Tuple[str, str, float, float]]:
+    """SCALP logic with flexible filters."""
     atr = safe_float(row.get("atr", np.nan))
     px = float(row["close"])
     bb_lo = float(row["bb_dn"])
@@ -754,41 +810,22 @@ def sig_scalp(symbol: str, row: pd.Series, cfg: Config) -> Optional[Tuple[str, s
     buy_cond  = (px <= bb_lo) and (rsi_val <= cfg.scalp_rsi_buy) and (atr > 0)
     sell_cond = (px >= bb_hi) and (rsi_val >= cfg.scalp_rsi_sell) and (atr > 0)
 
-    if cfg.filters_enabled:
-        # سيولة: vol_z أو بديل vol_pct
-        vol_z = float(row.get("vol_z", -10.0))
-        vol_pct = float(row.get("vol_pct", -1.0))
-        pass_liquidity = (vol_z >= float(cfg.min_vol_z)) or (vol_pct >= float(cfg.min_vol_pct_alt))
-        if not pass_liquidity:
-            if cfg.debug_signals:
-                print(f"[FILTER] {symbol} skip: vol(z={vol_z:.2f}) & pct({vol_pct:.2f}) below")
-            buy_cond = sell_cond = False
-
-        # تذبذب كافٍ (لين)
-        if float(row.get("atr_pct", 0.0)) < float(cfg.min_atr_pct):
-            if cfg.debug_signals:
-                print(f"[FILTER] {symbol} skip: atr_pct<{cfg.min_atr_pct}")
-            buy_cond = sell_cond = False
-
-        # اتجاه مع استثناء ذكي لحالات التطرّف: RSI بعيد + ملامسة قوية للحافة
-        if cfg.trend_filter:
-            ema_fast = float(row.get("ema_fast", np.nan))
-            ema_slow = float(row.get("ema_slow", np.nan))
-            band_w = max(1e-9, float(bb_hi - bb_lo))
-            touch_buy = float(np.clip((bb_lo + 0.10 * band_w - px) / band_w, 0.0, 1.0))
-            touch_sell = float(np.clip((px - (bb_hi - 0.10 * band_w)) / band_w, 0.0, 1.0))
-            rsi_buy_extreme = (rsi_val <= max(25.0, cfg.scalp_rsi_buy - 5.0))
-            rsi_sell_extreme = (rsi_val >= min(75.0, cfg.scalp_rsi_sell + 5.0))
-            allow_ct_buy = rsi_buy_extreme and (touch_buy >= 0.25)
-            allow_ct_sell = rsi_sell_extreme and (touch_sell >= 0.25)
-            if buy_cond and not (ema_fast > ema_slow) and not allow_ct_buy:
+    filter_scale = 1.0
+    if cfg.filters_enabled and (buy_cond or sell_cond):
+        side = "BUY" if buy_cond else "SELL"
+        passed, mask, score = eval_filters(side, row, cfg, px, bb_lo, bb_hi, rsi_val)
+        mode = (cfg.filter_mode or "kofn").lower()
+        if mode in ("strict", "any", "kofn"):
+            if not passed:
                 if cfg.debug_signals:
-                    print(f"[FILTER] {symbol} skip BUY: trend mismatch")
-                buy_cond = False
-            if sell_cond and not (ema_fast < ema_slow) and not allow_ct_sell:
-                if cfg.debug_signals:
-                    print(f"[FILTER] {symbol} skip SELL: trend mismatch")
-                sell_cond = False
+                    print(f"[FILTER] {symbol} BLOCK mode={mode} mask={mask} score={score:.2f}")
+                buy_cond = sell_cond = False
+        else:
+            lo = float(cfg.soft_scale_low)
+            hi = float(cfg.soft_scale_high)
+            filter_scale = float(np.clip(lo + (hi - lo) * score, lo, hi))
+            if cfg.debug_signals:
+                print(f"[FILTER] {symbol} SOFT scale={filter_scale:.2f} mask={mask} score={score:.2f}")
 
     side = "BUY" if buy_cond else ("SELL" if sell_cond else None)
     if side is None:
@@ -800,11 +837,14 @@ def sig_scalp(symbol: str, row: pd.Series, cfg: Config) -> Optional[Tuple[str, s
     if cfg.debug_signals:
         print(f"[QUAL] {symbol} side={side} q={quality:.2f}")
     if quality < float(cfg.min_quality):
-        if cfg.debug_signals: print(f"[QUAL] {symbol} skip: q<{cfg.min_quality}")
+        if cfg.debug_signals:
+            print(f"[QUAL] {symbol} skip: q<{cfg.min_quality}")
         return None
 
-    reason = f"SCALP: px<=BBlo & RSI={rsi_val:.1f}" if side == "BUY" else f"SCALP: px>=BBhi & RSI={rsi_val:.1f}"
-    return (side.lower(), reason, quality)
+    reason = (
+        f"SCALP: px<=BBlo & RSI={rsi_val:.1f}" if side == "BUY" else f"SCALP: px>=BBhi & RSI={rsi_val:.1f}"
+    )
+    return (side.lower(), reason, quality, filter_scale)
 
 def ctx_key(regime: Regime) -> str:
     return f"{regime.trend}|{regime.vol_bucket}"
@@ -1202,7 +1242,7 @@ class Bot:
     def can_alert_now(self) -> bool:
         return (time.time() - self.last_alert_ts) >= self.cfg.min_seconds_between_alerts_global
 
-    def _committee(self, symbol: str, row: pd.Series, regime: Regime) -> Optional[Tuple[str, str, float]]:
+    def _committee(self, symbol: str, row: pd.Series, regime: Regime) -> Optional[Tuple[str, str, float, float]]:
         return sig_scalp(symbol, row, self.cfg)
 
     def run(self):
@@ -1350,7 +1390,7 @@ class Bot:
                 if not sig_info:
                     continue
 
-                side, reason, quality = sig_info
+                side, reason, quality, filter_scale = sig_info
 
                 # Use live ticker price for entry to avoid stale candles
                 price = self.ex.fetch_ticker_price(symbol)
@@ -1383,6 +1423,10 @@ class Bot:
                     per_trade_capital = rem_cap / remaining_slots if remaining_slots > 0 else 0.0
 
                 target_notional = max(0.0, per_trade_capital) * lev
+                if filter_scale != 1.0:
+                    target_notional *= filter_scale
+                    if self.cfg.debug_signals:
+                        print(f"[FILTER] {symbol} scale={filter_scale:.2f} target_notional={target_notional:.2f}")
                 if self.cfg.quality_sizing:
                     q = max(0.0, min(1.0, quality))
                     lo_q = float(self.cfg.min_quality)
@@ -1489,7 +1533,11 @@ def parse_args() -> Config:
     p.add_argument("--no-trend-filter", action="store_true")
     p.add_argument("--min-atr-pct", type=float, default=None)
     p.add_argument("--min-vol-z", type=float, default=None)
-    p.add_argument("--min-vol-pct", type=float, default=None, help="volume percentile alt threshold (0..1)")
+    p.add_argument("--min-vol-pct-alt", type=float, default=None, help="volume percentile alt threshold (0..1)")
+    p.add_argument("--filter-mode", type=str, choices=["strict","any","kofn","soft"], default=None)
+    p.add_argument("--filters-k", type=int, default=None)
+    p.add_argument("--soft-scale-low", type=float, default=None)
+    p.add_argument("--soft-scale-high", type=float, default=None)
     p.add_argument("--quality-sizing-off", action="store_true")
     p.add_argument("--min-quality", type=float, default=None)
     p.add_argument("--size-scale-low", type=float, default=None)
@@ -1520,7 +1568,11 @@ def parse_args() -> Config:
     if args.no_trend_filter:              cfg.trend_filter = False
     if args.min_atr_pct is not None:      cfg.min_atr_pct = float(args.min_atr_pct)
     if args.min_vol_z is not None:        cfg.min_vol_z = float(args.min_vol_z)
-    if args.min_vol_pct is not None:      cfg.min_vol_pct_alt = float(args.min_vol_pct)
+    if args.min_vol_pct_alt is not None:  cfg.min_vol_pct_alt = float(args.min_vol_pct_alt)
+    if args.filter_mode is not None:      cfg.filter_mode = str(args.filter_mode)
+    if args.filters_k is not None:        cfg.filters_k = int(args.filters_k)
+    if args.soft_scale_low is not None:   cfg.soft_scale_low = float(args.soft_scale_low)
+    if args.soft_scale_high is not None:  cfg.soft_scale_high = float(args.soft_scale_high)
     if args.quality_sizing_off:           cfg.quality_sizing = False
     if args.min_quality is not None:      cfg.min_quality = float(args.min_quality)
     if args.size_scale_low is not None:   cfg.size_scale_low = float(args.size_scale_low)
