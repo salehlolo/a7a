@@ -16,7 +16,7 @@ import os, time, json, argparse, datetime as dt, math
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, List, Dict
 
-import numpy as np
+import numpy as np  # مطلوب لحسابات بسيطة بالفلتر
 import pandas as pd
 
 try:
@@ -94,14 +94,15 @@ class Config:
     max_notional: float = 1_000_000.0 # حد أقصى للقيمة الإسمية (أمان)
 
     # ===== Filters & Quality Sizing =====
-    filters_enabled: bool = True           # تفعيل فلاتر تقليل الصفقات الكاذبة
-    trend_filter: bool = True              # اتجاه: EMA fast > slow للشراء، والعكس للبيع
-    min_atr_pct: float = 0.20              # ATR كنسبة من متوسطه
-    min_vol_z: float = 0.50                # Z-Score للحجم
-    quality_sizing: bool = True            # ربط الحجم بجودة الإشارة
-    min_quality: float = 0.35              # أقل جودة مسموح بها
-    size_scale_low: float = 0.60           # معامل التصغير عند الجودة الدنيا المقبولة
-    size_scale_high: float = 1.30          # معامل التكبير عند الجودة العالية
+    filters_enabled: bool = True       # فلترة الإشارات
+    trend_filter: bool = True          # فلتر اتجاه
+    min_atr_pct: float = 0.15          # كان 0.20 → لِين بسيط
+    min_vol_z: float = 0.20            # كان 0.50 → يسمح بسيولة متوسطة
+    min_vol_pct_alt: float = 0.40      # حد بديل: الحجم ضمن أعلى 40% من نطاقه المحلي
+    quality_sizing: bool = True        # ربط الحجم بجودة الإشارة
+    min_quality: float = 0.35          # أقل جودة مسموح بها
+    size_scale_low: float = 0.60       # معامل التصغير عند الجودة الدنيا المقبولة
+    size_scale_high: float = 1.30      # معامل التكبير عند الجودة العالية
 
     # Indicators / windows
     ema_fast: int = 9
@@ -557,6 +558,14 @@ def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     vol_std = d["volume"].rolling(cfg.vol_ma_len, min_periods=cfg.vol_ma_len//2).std()
     d["vol_ma"] = vol_ma
     d["vol_z"] = (d["volume"] - vol_ma) / vol_std.replace(0, np.nan)
+
+    # بديل للسيولة: نسبة الحجم داخل نطاقه المحلي (0..1)
+    _w = max(10, int(cfg.vol_ma_len))
+    vmin = d["volume"].rolling(_w, min_periods=_w//2).min()
+    vmax = d["volume"].rolling(_w, min_periods=_w//2).max()
+    vrng = (vmax - vmin).replace(0, np.nan)
+    d["vol_pct"] = (d["volume"] - vmin) / vrng
+
     d["vol_spike"] = d["volume"] > (vol_ma * cfg.trend_vol_mult)
     d["bo_vol_spike"] = d["volume"] > (vol_ma * cfg.bo_vol_mult)
 
@@ -746,20 +755,39 @@ def sig_scalp(symbol: str, row: pd.Series, cfg: Config) -> Optional[Tuple[str, s
     sell_cond = (px >= bb_hi) and (rsi_val >= cfg.scalp_rsi_sell) and (atr > 0)
 
     if cfg.filters_enabled:
-        if float(row.get("vol_z", -10.0)) < float(cfg.min_vol_z):
-            if cfg.debug_signals: print(f"[FILTER] {symbol} skip: vol_z<{cfg.min_vol_z}")
+        # سيولة: vol_z أو بديل vol_pct
+        vol_z = float(row.get("vol_z", -10.0))
+        vol_pct = float(row.get("vol_pct", -1.0))
+        pass_liquidity = (vol_z >= float(cfg.min_vol_z)) or (vol_pct >= float(cfg.min_vol_pct_alt))
+        if not pass_liquidity:
+            if cfg.debug_signals:
+                print(f"[FILTER] {symbol} skip: vol(z={vol_z:.2f}) & pct({vol_pct:.2f}) below")
             buy_cond = sell_cond = False
+
+        # تذبذب كافٍ (لين)
         if float(row.get("atr_pct", 0.0)) < float(cfg.min_atr_pct):
-            if cfg.debug_signals: print(f"[FILTER] {symbol} skip: atr_pct<{cfg.min_atr_pct}")
+            if cfg.debug_signals:
+                print(f"[FILTER] {symbol} skip: atr_pct<{cfg.min_atr_pct}")
             buy_cond = sell_cond = False
+
+        # اتجاه مع استثناء ذكي لحالات التطرّف: RSI بعيد + ملامسة قوية للحافة
         if cfg.trend_filter:
             ema_fast = float(row.get("ema_fast", np.nan))
             ema_slow = float(row.get("ema_slow", np.nan))
-            if buy_cond and not (ema_fast > ema_slow):
-                if cfg.debug_signals: print(f"[FILTER] {symbol} skip BUY: trend mismatch")
+            band_w = max(1e-9, float(bb_hi - bb_lo))
+            touch_buy = float(np.clip((bb_lo + 0.10 * band_w - px) / band_w, 0.0, 1.0))
+            touch_sell = float(np.clip((px - (bb_hi - 0.10 * band_w)) / band_w, 0.0, 1.0))
+            rsi_buy_extreme = (rsi_val <= max(25.0, cfg.scalp_rsi_buy - 5.0))
+            rsi_sell_extreme = (rsi_val >= min(75.0, cfg.scalp_rsi_sell + 5.0))
+            allow_ct_buy = rsi_buy_extreme and (touch_buy >= 0.25)
+            allow_ct_sell = rsi_sell_extreme and (touch_sell >= 0.25)
+            if buy_cond and not (ema_fast > ema_slow) and not allow_ct_buy:
+                if cfg.debug_signals:
+                    print(f"[FILTER] {symbol} skip BUY: trend mismatch")
                 buy_cond = False
-            if sell_cond and not (ema_fast < ema_slow):
-                if cfg.debug_signals: print(f"[FILTER] {symbol} skip SELL: trend mismatch")
+            if sell_cond and not (ema_fast < ema_slow) and not allow_ct_sell:
+                if cfg.debug_signals:
+                    print(f"[FILTER] {symbol} skip SELL: trend mismatch")
                 sell_cond = False
 
     side = "BUY" if buy_cond else ("SELL" if sell_cond else None)
@@ -1461,6 +1489,7 @@ def parse_args() -> Config:
     p.add_argument("--no-trend-filter", action="store_true")
     p.add_argument("--min-atr-pct", type=float, default=None)
     p.add_argument("--min-vol-z", type=float, default=None)
+    p.add_argument("--min-vol-pct", type=float, default=None, help="volume percentile alt threshold (0..1)")
     p.add_argument("--quality-sizing-off", action="store_true")
     p.add_argument("--min-quality", type=float, default=None)
     p.add_argument("--size-scale-low", type=float, default=None)
@@ -1491,6 +1520,7 @@ def parse_args() -> Config:
     if args.no_trend_filter:              cfg.trend_filter = False
     if args.min_atr_pct is not None:      cfg.min_atr_pct = float(args.min_atr_pct)
     if args.min_vol_z is not None:        cfg.min_vol_z = float(args.min_vol_z)
+    if args.min_vol_pct is not None:      cfg.min_vol_pct_alt = float(args.min_vol_pct)
     if args.quality_sizing_off:           cfg.quality_sizing = False
     if args.min_quality is not None:      cfg.min_quality = float(args.min_quality)
     if args.size_scale_low is not None:   cfg.size_scale_low = float(args.size_scale_low)
