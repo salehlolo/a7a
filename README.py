@@ -447,7 +447,11 @@ class FuturesExchange:
                 self._bad_cache[s] = nowt
             time.sleep(0.05)
         if not ok:
-            ok = ["BTC/USDT:USDT","ETH/USDT:USDT"]
+            fallback = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+            for s in fallback:
+                last_bad = self._bad_cache.get(s, 0)
+                if nowt - last_bad >= self.cfg.health_refresh_minutes * 60:
+                    ok.append(s)
         return ok
 
 # =========================
