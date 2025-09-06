@@ -336,7 +336,8 @@ class FuturesExchange:
             batch = min(remaining, max_per_call)
             try:
                 ohlcv = self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=batch, since=since)
-            except Exception:
+            except Exception as e:
+                print(f"[WARN] fetch_ohlcv failed for {symbol}: {e}")
                 break
             if not ohlcv:
                 break
