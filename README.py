@@ -93,6 +93,16 @@ class Config:
     min_notional: float = 10.0        # حد أدنى للقيمة الإسمية للصفقة
     max_notional: float = 1_000_000.0 # حد أقصى للقيمة الإسمية (أمان)
 
+    # ===== Filters & Quality Sizing =====
+    filters_enabled: bool = True           # تفعيل فلاتر تقليل الصفقات الكاذبة
+    trend_filter: bool = True              # اتجاه: EMA fast > slow للشراء، والعكس للبيع
+    min_atr_pct: float = 0.20              # ATR كنسبة من متوسطه
+    min_vol_z: float = 0.50                # Z-Score للحجم
+    quality_sizing: bool = True            # ربط الحجم بجودة الإشارة
+    min_quality: float = 0.35              # أقل جودة مسموح بها
+    size_scale_low: float = 0.60           # معامل التصغير عند الجودة الدنيا المقبولة
+    size_scale_high: float = 1.30          # معامل التكبير عند الجودة العالية
+
     # Indicators / windows
     ema_fast: int = 9
     ema_slow: int = 21
@@ -522,8 +532,10 @@ class FuturesExchange:
 def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     d = df.copy()
 
-    d["ema9"]  = ta.trend.EMAIndicator(d["close"], window=cfg.ema_fast).ema_indicator()
-    d["ema21"] = ta.trend.EMAIndicator(d["close"], window=cfg.ema_slow).ema_indicator()
+    d["ema_fast"] = ta.trend.EMAIndicator(d["close"], window=cfg.ema_fast).ema_indicator()
+    d["ema_slow"] = ta.trend.EMAIndicator(d["close"], window=cfg.ema_slow).ema_indicator()
+    d["ema9"]  = d["ema_fast"]
+    d["ema21"] = d["ema_slow"]
 
     d["rsi"] = ta.momentum.RSIIndicator(d["close"], window=cfg.rsi_len).rsi()
 
@@ -532,16 +544,21 @@ def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     atr = ta.volatility.AverageTrueRange(d["high"], d["low"], d["close"], window=cfg.atr_window)
     d["atr"] = atr.average_true_range()
-    d["atr_pct"] = d["atr"] / d["close"]
+    atr_ma_win = max(10, int(cfg.atr_window * 3))
+    d["atr_ma"] = d["atr"].rolling(atr_ma_win, min_periods=atr_ma_win//2).mean()
+    d["atr_pct"] = d["atr"] / d["atr_ma"]
 
     session = d.index.tz_convert("UTC").normalize()
     d["vwap_num"] = (d["close"] * d["volume"]).groupby(session).cumsum()
     d["vwap_den"] = d["volume"].groupby(session).cumsum().replace(0, np.nan)
     d["vwap"] = d["vwap_num"] / d["vwap_den"]
 
-    d["vol_ma"] = d["volume"].rolling(cfg.vol_ma_len).mean()
-    d["vol_spike"] = d["volume"] > (d["vol_ma"] * cfg.trend_vol_mult)
-    d["bo_vol_spike"] = d["volume"] > (d["vol_ma"] * cfg.bo_vol_mult)
+    vol_ma = d["volume"].rolling(cfg.vol_ma_len, min_periods=cfg.vol_ma_len//2).mean()
+    vol_std = d["volume"].rolling(cfg.vol_ma_len, min_periods=cfg.vol_ma_len//2).std()
+    d["vol_ma"] = vol_ma
+    d["vol_z"] = (d["volume"] - vol_ma) / vol_std.replace(0, np.nan)
+    d["vol_spike"] = d["volume"] > (vol_ma * cfg.trend_vol_mult)
+    d["bo_vol_spike"] = d["volume"] > (vol_ma * cfg.bo_vol_mult)
 
     d["recent_high"] = d["high"].rolling(cfg.box_len).max()
     d["recent_low"]  = d["low"].rolling(cfg.box_len).min()
@@ -571,6 +588,34 @@ def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     d = d.replace([np.inf, -np.inf], np.nan).dropna()
     return d
+
+# =========================
+# Quality Scoring
+# =========================
+def score_signal(side: str, row: pd.Series, cfg: Config) -> float:
+    px = float(row["close"])
+    bb_lo = float(row.get("bb_dn", np.nan))
+    bb_hi = float(row.get("bb_up", np.nan))
+    rsi   = float(row.get("rsi", np.nan))
+    atr_pct = float(row.get("atr_pct", 0.0))
+    vol_z   = float(row.get("vol_z", -10.0))
+    ema_fast = float(row.get("ema_fast", np.nan))
+    ema_slow = float(row.get("ema_slow", np.nan))
+    if any([np.isnan(v) for v in [bb_lo, bb_hi, rsi, ema_fast, ema_slow]]):
+        return 0.0
+    band_w = max(1e-12, bb_hi - bb_lo)
+    if side == "BUY":
+        band_score = np.clip((bb_lo + (band_w * 0.15) - px) / band_w, 0.0, 1.0)
+        rsi_score  = np.clip((45.0 - rsi) / 45.0, 0.0, 1.0)
+        trend_score = 1.0 if ema_fast > ema_slow else 0.0
+    else:
+        band_score = np.clip((px - (bb_hi - (band_w * 0.15))) / band_w, 0.0, 1.0)
+        rsi_score  = np.clip((rsi - 55.0) / 45.0, 0.0, 1.0)
+        trend_score = 1.0 if ema_fast < ema_slow else 0.0
+    atr_score = np.clip(atr_pct / 1.5, 0.0, 1.0)
+    vol_score = np.clip((vol_z - 0.0) / 2.0, 0.0, 1.0)
+    q = (0.30*band_score + 0.20*rsi_score + 0.20*atr_score + 0.15*vol_score + 0.15*trend_score)
+    return float(np.clip(q, 0.0, 1.0))
 
 # =========================
 # Regime
@@ -681,45 +726,57 @@ def strat(df: pd.DataFrame):
 # SCALP strategy (BB + RSI)
 # =========================
 
-def sig_scalp(row: pd.Series, cfg: Config) -> Optional[Tuple[str, str]]:
-    """Basic SCALP strategy based on Bollinger Bands and RSI."""
-    a = safe_float(row.get("atr", np.nan))
-    price = float(row["close"])
+def sig_scalp(symbol: str, row: pd.Series, cfg: Config) -> Optional[Tuple[str, str, float]]:
+    """SCALP logic مع فلاتر الجودة."""
+    atr = safe_float(row.get("atr", np.nan))
+    px = float(row["close"])
     bb_lo = float(row["bb_dn"])
     bb_hi = float(row["bb_up"])
-    r = float(row["rsi"])
+    rsi_val = float(row["rsi"])
 
     if cfg.debug_signals:
-        print(
-            f"[DEBUG] SCALP inputs: px={price:.4f} bb_lo={bb_lo:.4f} "
-            f"bb_hi={bb_hi:.4f} rsi={r:.2f} atr={a:.4f}"
-        )
+        print(f"[DEBUG] SCALP inputs: px={px:.4f} bb_lo={bb_lo:.4f} bb_hi={bb_hi:.4f} rsi={rsi_val:.2f} atr={atr:.4f}")
 
-    if np.isnan(a) or a <= 0:
+    if np.isnan(atr) or atr <= 0:
         if cfg.debug_signals:
-            print(f"[DEBUG] SCALP skip: invalid ATR={a}")
+            print(f"[DEBUG] SCALP skip: invalid ATR={atr}")
         return None
 
-    if price <= bb_lo and r <= cfg.scalp_rsi_buy and a > 0:
+    buy_cond  = (px <= bb_lo) and (rsi_val <= cfg.scalp_rsi_buy) and (atr > 0)
+    sell_cond = (px >= bb_hi) and (rsi_val >= cfg.scalp_rsi_sell) and (atr > 0)
+
+    if cfg.filters_enabled:
+        if float(row.get("vol_z", -10.0)) < float(cfg.min_vol_z):
+            if cfg.debug_signals: print(f"[FILTER] {symbol} skip: vol_z<{cfg.min_vol_z}")
+            buy_cond = sell_cond = False
+        if float(row.get("atr_pct", 0.0)) < float(cfg.min_atr_pct):
+            if cfg.debug_signals: print(f"[FILTER] {symbol} skip: atr_pct<{cfg.min_atr_pct}")
+            buy_cond = sell_cond = False
+        if cfg.trend_filter:
+            ema_fast = float(row.get("ema_fast", np.nan))
+            ema_slow = float(row.get("ema_slow", np.nan))
+            if buy_cond and not (ema_fast > ema_slow):
+                if cfg.debug_signals: print(f"[FILTER] {symbol} skip BUY: trend mismatch")
+                buy_cond = False
+            if sell_cond and not (ema_fast < ema_slow):
+                if cfg.debug_signals: print(f"[FILTER] {symbol} skip SELL: trend mismatch")
+                sell_cond = False
+
+    side = "BUY" if buy_cond else ("SELL" if sell_cond else None)
+    if side is None:
         if cfg.debug_signals:
-            print(
-                f"[DEBUG] SCALP buy trigger: price<=BBlo ({price:.4f}<={bb_lo:.4f}) "
-                f"and RSI {r:.2f}<={cfg.scalp_rsi_buy}"
-            )
-        return ("buy", f"SCALP: px<=BBlo & RSI={r:.1f}")
-    if price >= bb_hi and r >= cfg.scalp_rsi_sell and a > 0:
-        if cfg.debug_signals:
-            print(
-                f"[DEBUG] SCALP sell trigger: price>=BBhi ({price:.4f}>={bb_hi:.4f}) "
-                f"and RSI {r:.2f}>={cfg.scalp_rsi_sell}"
-            )
-        return ("sell", f"SCALP: px>=BBhi & RSI={r:.1f}")
+            print(f"[DEBUG] SCALP skip: px={px:.4f} bb_lo={bb_lo:.4f} bb_hi={bb_hi:.4f} rsi={rsi_val:.2f} atr={atr:.4f}")
+        return None
+
+    quality = score_signal(side, row, cfg)
     if cfg.debug_signals:
-        print(
-            f"[DEBUG] SCALP skip: px={price:.4f} bb_lo={bb_lo:.4f} "
-            f"bb_hi={bb_hi:.4f} rsi={r:.2f} atr={a:.4f}"
-        )
-    return None
+        print(f"[QUAL] {symbol} side={side} q={quality:.2f}")
+    if quality < float(cfg.min_quality):
+        if cfg.debug_signals: print(f"[QUAL] {symbol} skip: q<{cfg.min_quality}")
+        return None
+
+    reason = f"SCALP: px<=BBlo & RSI={rsi_val:.1f}" if side == "BUY" else f"SCALP: px>=BBhi & RSI={rsi_val:.1f}"
+    return (side.lower(), reason, quality)
 
 def ctx_key(regime: Regime) -> str:
     return f"{regime.trend}|{regime.vol_bucket}"
@@ -1117,8 +1174,8 @@ class Bot:
     def can_alert_now(self) -> bool:
         return (time.time() - self.last_alert_ts) >= self.cfg.min_seconds_between_alerts_global
 
-    def _committee(self, symbol: str, row: pd.Series, regime: Regime) -> Optional[Tuple[str, str]]:
-        return sig_scalp(row, self.cfg)
+    def _committee(self, symbol: str, row: pd.Series, regime: Regime) -> Optional[Tuple[str, str, float]]:
+        return sig_scalp(symbol, row, self.cfg)
 
     def run(self):
         self.notifier.send(f"[START] Evolving Scalper | TOP {self.cfg.top_n_symbols} | TF {self.cfg.timeframe} | RefEq={self.ref_equity:.2f} USDT")
@@ -1265,7 +1322,7 @@ class Bot:
                 if not sig_info:
                     continue
 
-                side, reason = sig_info
+                side, reason, quality = sig_info
 
                 # Use live ticker price for entry to avoid stale candles
                 price = self.ex.fetch_ticker_price(symbol)
@@ -1298,6 +1355,17 @@ class Bot:
                     per_trade_capital = rem_cap / remaining_slots if remaining_slots > 0 else 0.0
 
                 target_notional = max(0.0, per_trade_capital) * lev
+                if self.cfg.quality_sizing:
+                    q = max(0.0, min(1.0, quality))
+                    lo_q = float(self.cfg.min_quality)
+                    if q <= lo_q:
+                        scale = float(self.cfg.size_scale_low)
+                    else:
+                        t = (q - lo_q) / (1.0 - lo_q)
+                        scale = float(self.cfg.size_scale_low) + t * (float(self.cfg.size_scale_high) - float(self.cfg.size_scale_low))
+                    target_notional *= max(0.0, scale)
+                    if self.cfg.debug_signals:
+                        print(f"[QUAL] {symbol} scale={scale:.2f} target_notional={target_notional:.2f}")
                 target_notional = max(float(self.cfg.min_notional),
                                       min(float(self.cfg.max_notional), target_notional))
 
@@ -1322,11 +1390,9 @@ class Bot:
                     continue
 
                 if self.cfg.debug_signals:
-                    print(f"[RISK] {symbol} open={open_cnt}/{max_slots} rem_slots={remaining_slots} "
-                          f"used_cap={used_capital:.2f} total_cap={total_capital:.2f} "
-                          f"per_cap={per_trade_capital:.2f} lev={lev:.1f} "
-                          f"target_notional={target_notional:.2f} req_margin={req_margin:.2f} "
-                          f"contracts={contract_qty:.6f}")
+                    print(f"[RISK] {symbol} open={open_cnt}/{max_slots} rem={remaining_slots} used={used_capital:.2f} "
+                          f"total={total_capital:.2f} per={per_trade_capital:.2f} q={quality:.2f} "
+                          f"lev={lev:.1f} notional={notional:.2f} req_margin={req_margin:.2f} qty={contract_qty:.6f}")
 
                 base_qty = contract_qty * contract_size
                 notional_ref = notional
@@ -1390,6 +1456,15 @@ def parse_args() -> Config:
     p.add_argument("--dynamic-split", action="store_true", help="use dynamic split of remaining capital")
     p.add_argument("--min-notional", type=float, default=None)
     p.add_argument("--max-notional", type=float, default=None)
+    # ---- CLI: فلاتر/جودة ----
+    p.add_argument("--filters-off", action="store_true")
+    p.add_argument("--no-trend-filter", action="store_true")
+    p.add_argument("--min-atr-pct", type=float, default=None)
+    p.add_argument("--min-vol-z", type=float, default=None)
+    p.add_argument("--quality-sizing-off", action="store_true")
+    p.add_argument("--min-quality", type=float, default=None)
+    p.add_argument("--size-scale-low", type=float, default=None)
+    p.add_argument("--size-scale-high", type=float, default=None)
     args = p.parse_args()
     cfg = Config()
     cfg.timeframe = args.timeframe
@@ -1411,6 +1486,15 @@ def parse_args() -> Config:
         cfg.dynamic_split_mode = True
     if args.min_notional is not None:     cfg.min_notional = float(args.min_notional)
     if args.max_notional is not None:     cfg.max_notional = float(args.max_notional)
+    # تطبيق CLI: فلاتر/جودة
+    if args.filters_off:                  cfg.filters_enabled = False
+    if args.no_trend_filter:              cfg.trend_filter = False
+    if args.min_atr_pct is not None:      cfg.min_atr_pct = float(args.min_atr_pct)
+    if args.min_vol_z is not None:        cfg.min_vol_z = float(args.min_vol_z)
+    if args.quality_sizing_off:           cfg.quality_sizing = False
+    if args.min_quality is not None:      cfg.min_quality = float(args.min_quality)
+    if args.size_scale_low is not None:   cfg.size_scale_low = float(args.size_scale_low)
+    if args.size_scale_high is not None:  cfg.size_scale_high = float(args.size_scale_high)
     # اسمح بتجاوز الإعدادات من سطر الأوامر
     if args.top is not None:
         cfg.top_n_symbols = int(args.top)
