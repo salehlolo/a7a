@@ -117,11 +117,14 @@ class Config:
     squeeze_bb_mult: float = 1.6
 
     # SCALP strategy tuning
-    scalp_rsi_buy: float = 40.0
-    scalp_rsi_sell: float = 60.0
+    # إعدادات سكالب أخفّ قليلًا لزيادة تكرار الإشارات
+    scalp_rsi_buy: float = 45.0
+    scalp_rsi_sell: float = 55.0
     scalp_tp_atr_mult: float = 1.2
     scalp_sl_atr_mult: float = 0.8
-    scalp_bb_k: float = 2.0
+    scalp_bb_k: float = 1.8
+    # سماحية قرب من حدود بولنجر كنسبة من عرض القناة (15% افتراضيًا)
+    scalp_band_tolerance_mult: float = 0.15
     debug_signals: bool = True   # كان False، فعّله افتراضيًا للتشخيص
 
     # Sizing
@@ -627,20 +630,30 @@ def sig_scalp(row: pd.Series, cfg: Config) -> Optional[Tuple[str, str]]:
         if cfg.debug_signals:
             print(f"[DEBUG] SCALP skip: invalid ATR={a}")
         return None
-    if price <= bb_lo and r <= cfg.scalp_rsi_buy:
+
+    band_width = float(bb_hi - bb_lo)
+    tol = band_width * float(cfg.scalp_band_tolerance_mult)
+    buy_cond = (price <= (bb_lo + tol)) and (r <= cfg.scalp_rsi_buy) and (a > 0)
+    sell_cond = (price >= (bb_hi - tol)) and (r >= cfg.scalp_rsi_sell) and (a > 0)
+    if cfg.debug_signals:
+        print(
+            f"[DBG][SCALP] band_width={band_width:.6f} tol={tol:.6f} "
+            f"buy_zone<= {bb_lo + tol:.6f} sell_zone>= {bb_hi - tol:.6f}"
+        )
+    if buy_cond:
         if cfg.debug_signals:
             print(
-                f"[DEBUG] SCALP buy trigger: price<=BBlo ({price:.4f}<={bb_lo:.4f}) "
+                f"[DEBUG] SCALP buy trigger: price<=BBlo+tol ({price:.4f}<={bb_lo + tol:.4f}) "
                 f"and RSI {r:.2f}<={cfg.scalp_rsi_buy}"
             )
-        return ("buy", f"SCALP: px<=BBlo & RSI={r:.1f}")
-    if price >= bb_hi and r >= cfg.scalp_rsi_sell:
+        return ("buy", f"SCALP: px<=BBlo+tol & RSI={r:.1f}")
+    if sell_cond:
         if cfg.debug_signals:
             print(
-                f"[DEBUG] SCALP sell trigger: price>=BBhi ({price:.4f}>={bb_hi:.4f}) "
+                f"[DEBUG] SCALP sell trigger: price>=BBhi-tol ({price:.4f}>={bb_hi - tol:.4f}) "
                 f"and RSI {r:.2f}>={cfg.scalp_rsi_sell}"
             )
-        return ("sell", f"SCALP: px>=BBhi & RSI={r:.1f}")
+        return ("sell", f"SCALP: px>=BBhi-tol & RSI={r:.1f}")
     if cfg.debug_signals:
         print(
             f"[DEBUG] SCALP skip: px={price:.4f} bb_lo={bb_lo:.4f} "
@@ -1268,6 +1281,10 @@ def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Evolving Committee Scalper (Alerts Only) — No OpenAI")
     p.add_argument("--timeframe", default="30m")
     p.add_argument("--lookback", type=int, default=None)
+    p.add_argument("--scalp-rsi-buy", type=float, default=None)
+    p.add_argument("--scalp-rsi-sell", type=float, default=None)
+    p.add_argument("--scalp-bb-k", type=float, default=None)
+    p.add_argument("--scalp-tol", type=float, default=None, help="tolerance as fraction of band width, e.g. 0.15")
     p.add_argument("--no-debug", action="store_true")            # لإطفاء الديباج عند الحاجة
     p.add_argument("--no-funding-filter", action="store_true")   # لتعطيل فلتر الفاندنغ مؤقتًا
     p.add_argument("--quiet", nargs="*", default=None, help="UTC HH:MM times to avoid (e.g., 12:30 18:00)")
@@ -1279,6 +1296,14 @@ def parse_args() -> Config:
     cfg.okx_demo = not args.live
     if args.lookback is not None:
         cfg.lookback = int(args.lookback)
+    if args.scalp_rsi_buy is not None:
+        cfg.scalp_rsi_buy = float(args.scalp_rsi_buy)
+    if args.scalp_rsi_sell is not None:
+        cfg.scalp_rsi_sell = float(args.scalp_rsi_sell)
+    if args.scalp_bb_k is not None:
+        cfg.scalp_bb_k = float(args.scalp_bb_k)
+    if args.scalp_tol is not None:
+        cfg.scalp_band_tolerance_mult = float(args.scalp_tol)
     if args.no_debug:
         cfg.debug_signals = False
     if args.no_funding_filter:
