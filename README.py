@@ -122,7 +122,7 @@ class Config:
     scalp_tp_atr_mult: float = 1.2
     scalp_sl_atr_mult: float = 0.8
     scalp_bb_k: float = 2.0
-    debug_signals: bool = False
+    debug_signals: bool = True   # كان False، فعّله افتراضيًا للتشخيص
 
     # Sizing
     max_open_trades: int = 1
@@ -1085,6 +1085,12 @@ class Bot:
                     continue
 
                 last = d.iloc[-1]
+                if self.cfg.debug_signals:
+                    print(
+                        f"[DBG][{symbol}] len={len(d)} last.close={last['close']:.6f} "
+                        f"rsi={last['rsi']:.2f} bb_dn={last['bb_dn']:.6f} "
+                        f"bb_up={last['bb_up']:.6f} atr={last['atr']:.6f}"
+                    )
                 closed = self.paper.update_with_candle(symbol, float(last["high"]), float(last["low"]), last.name)
                 if closed:
                     for t in closed:
@@ -1169,7 +1175,13 @@ class Bot:
                     )
                     continue
 
-                row = d.iloc[-2]
+                row = d.iloc[-2]  # الشمعة المغلقة الأخيرة
+                if self.cfg.debug_signals:
+                    print(
+                        f"[DBG][{symbol}] prev.close={row['close']:.6f} rsi={row['rsi']:.2f} "
+                        f"in_band=({row['close']<=row['bb_dn']:.0f}/{row['close']>=row['bb_up']:.0f}) "
+                        f"atr={row['atr']:.6f}"
+                    )
                 regime = classify_regime(row, self.cfg)
 
                 # Determine if SCALP conditions are met
@@ -1256,6 +1268,8 @@ def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Evolving Committee Scalper (Alerts Only) — No OpenAI")
     p.add_argument("--timeframe", default="30m")
     p.add_argument("--lookback", type=int, default=None)
+    p.add_argument("--no-debug", action="store_true")            # لإطفاء الديباج عند الحاجة
+    p.add_argument("--no-funding-filter", action="store_true")   # لتعطيل فلتر الفاندنغ مؤقتًا
     p.add_argument("--quiet", nargs="*", default=None, help="UTC HH:MM times to avoid (e.g., 12:30 18:00)")
     p.add_argument("--top", type=int, default=None, help="Top N USDT perpetuals to scan (override config)")
     p.add_argument("--live", action="store_true", help="Use real trading environment instead of OKX demo")
@@ -1265,9 +1279,15 @@ def parse_args() -> Config:
     cfg.okx_demo = not args.live
     if args.lookback is not None:
         cfg.lookback = int(args.lookback)
+    if args.no_debug:
+        cfg.debug_signals = False
+    if args.no_funding_filter:
+        cfg.funding_filter = False
     # اسمح بتجاوز الإعدادات من سطر الأوامر
-    if args.top is not None: cfg.top_n_symbols = int(args.top)
-    if args.quiet is not None: cfg.quiet_windows_utc = tuple(args.quiet)
+    if args.top is not None:
+        cfg.top_n_symbols = int(args.top)
+    if args.quiet is not None:
+        cfg.quiet_windows_utc = tuple(args.quiet)
     ensure_dir(cfg.logs_dir)
     ensure_dir(cfg.signals_csv); ensure_dir(cfg.trades_csv); ensure_dir(cfg.ml_csv); ensure_dir(cfg.models_csv)
     return cfg
