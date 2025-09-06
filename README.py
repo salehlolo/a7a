@@ -84,9 +84,9 @@ class Config:
     timeframe: str = "30m"
     lookback: int = 300
 
-    # === Capital & Leverage Control (defaults per your request) ===
-    leverage_x: float = 15.0          # الرافعة المالية (X)
-    capital_pct: float = 1.0          # نسبة رأس المال المستخدمة إجمالًا (1.0 = 100%)
+    # ===== Default Risk Settings (updated) =====
+    leverage_x: float = 10.0      # ثابت X10
+    capital_pct: float = 0.90     # 90% من رأس المال
     max_open_trades: int = 3          # الحد الأقصى للصفقات المتزامنة
     equal_split_mode: bool = False    # تقسيم ثابت (True) أم ديناميكي (False)
     dynamic_split_mode: bool = True   # تقسيم ديناميكي للمتبقي على الخانات المتبقية
@@ -1521,8 +1521,8 @@ def parse_args() -> Config:
     p.add_argument("--live", action="store_true", help="Use real trading environment instead of OKX demo")
 
     # === CLI overrides for capital/leverage tool ===
-    p.add_argument("--leverage-x", type=float, default=None, help="set leverage X (e.g., 15)")
-    p.add_argument("--capital-pct", type=float, default=None, help="fraction of balance to use (1.0 = 100%)")
+    p.add_argument("--leverage-x", type=float, default=None)   # تستطيع تغييره من CLI عند الحاجة
+    p.add_argument("--capital-pct", type=float, default=None)  # تستطيع تغييره من CLI عند الحاجة
     p.add_argument("--max-open-trades", type=int, default=None, help="max concurrent trades (e.g., 3)")
     p.add_argument("--equal-split", action="store_true", help="use equal split: total/slots")
     p.add_argument("--dynamic-split", action="store_true", help="use dynamic split of remaining capital")
