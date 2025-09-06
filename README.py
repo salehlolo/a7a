@@ -433,10 +433,15 @@ class FuturesExchange:
             if nowt - last_ok < self.cfg.health_refresh_minutes*60:
                 ok.append(s); continue
             try:
-                _ = self.fetch_ohlcv(s, self.cfg.timeframe, limit=self.cfg.health_test_limit)
-                if _.shape[0] > 10:
-                    ok.append(s); self._health_cache[s] = nowt
+                _ = self.fetch_ohlcv(s, self.cfg.timeframe, limit=self.cfg.lookback)
+                if _.shape[0] >= self.cfg.lookback:
+                    ok.append(s)
+                    self._health_cache[s] = nowt
                 else:
+                    print(
+                        f"[WARN] insufficient history for {s}: "
+                        f"{_.shape[0]} < {self.cfg.lookback}"
+                    )
                     self._bad_cache[s] = nowt
             except Exception:
                 self._bad_cache[s] = nowt
@@ -572,20 +577,40 @@ def get_tp_sl(entry: float, side: str, row: pd.Series, cfg: Config) -> Tuple[flo
 def sig_scalp(row: pd.Series, cfg: Config) -> Optional[Tuple[str, str]]:
     """Determine SCALP trade direction based on Bollinger and RSI."""
     a = safe_float(row.get("atr", np.nan))
-    if np.isnan(a) or a <= 0:
-        if cfg.debug_signals:
-            print("[DEBUG] SCALP skip: invalid ATR")
-        return None
     price = float(row["close"])
     bb_lo = float(row["bb_dn"])
     bb_hi = float(row["bb_up"])
     r = float(row["rsi"])
+
+    if cfg.debug_signals:
+        print(
+            f"[DEBUG] SCALP inputs: px={price:.4f} bb_lo={bb_lo:.4f} "
+            f"bb_hi={bb_hi:.4f} rsi={r:.2f} atr={a:.4f}"
+        )
+
+    if np.isnan(a) or a <= 0:
+        if cfg.debug_signals:
+            print(f"[DEBUG] SCALP skip: invalid ATR={a}")
+        return None
     if price <= bb_lo and r <= cfg.scalp_rsi_buy:
+        if cfg.debug_signals:
+            print(
+                f"[DEBUG] SCALP buy trigger: price<=BBlo ({price:.4f}<={bb_lo:.4f}) "
+                f"and RSI {r:.2f}<={cfg.scalp_rsi_buy}"
+            )
         return ("buy", f"SCALP: px<=BBlo & RSI={r:.1f}")
     if price >= bb_hi and r >= cfg.scalp_rsi_sell:
+        if cfg.debug_signals:
+            print(
+                f"[DEBUG] SCALP sell trigger: price>=BBhi ({price:.4f}>={bb_hi:.4f}) "
+                f"and RSI {r:.2f}>={cfg.scalp_rsi_sell}"
+            )
         return ("sell", f"SCALP: px>=BBhi & RSI={r:.1f}")
     if cfg.debug_signals:
-        print(f"[DEBUG] SCALP skip: px={price:.4f} bb_lo={bb_lo:.4f} bb_hi={bb_hi:.4f} rsi={r:.2f}")
+        print(
+            f"[DEBUG] SCALP skip: px={price:.4f} bb_lo={bb_lo:.4f} "
+            f"bb_hi={bb_hi:.4f} rsi={r:.2f} atr={a:.4f}"
+        )
     return None
 
 def ctx_key(regime: Regime) -> str:
@@ -683,6 +708,28 @@ class Paper:
         for k in to_close:
             self.open.pop(k, None)
         return closed
+
+    def force_close(self, trade: PaperTrade, price: float, reason: str = "timeout") -> PaperTrade:
+        """Forcefully close an open trade at the given ``price``.
+
+        Parameters
+        ----------
+        trade: PaperTrade
+            The trade to close.
+        price: float
+            The price at which the trade is closed.
+        reason: str
+            Label to store in ``trade.result`` describing why the trade was
+            closed (default: ``"timeout"``).
+        """
+        trade.status = "closed"
+        trade.result = reason
+        trade.exit_price = float(price)
+        trade.exit_time = fmt_ts()
+        pnl = (trade.exit_price - trade.entry) * trade.qty * (1 if trade.side == "buy" else -1)
+        trade.pnl_usd = round(pnl, 4)
+        self.open.pop(trade.id, None)
+        return trade
 
     def persist_closed(self, closed: List[PaperTrade], cfg: Config, ctx: str):
         if not closed: return
@@ -846,6 +893,7 @@ class Bot:
         self.last_time: Dict[str, Optional[dt.datetime]] = {}
         self.last_alert_ts: float = 0.0
         self.closed_trades: List[PaperTrade] = []
+        self.data_fail: Dict[str, int] = {}
         self.model_state: Dict[str, dict] = {}
         self.load_model_state()
         self.last_hourly_report = now_utc()
@@ -983,8 +1031,23 @@ class Bot:
         for symbol in self.symbols:
             try:
                 df = self.ex.fetch_ohlcv(symbol, self.cfg.timeframe, limit=self.cfg.lookback)
+                if len(df) < self.cfg.lookback:
+                    print(
+                        f"[WARN] insufficient OHLCV for {symbol}: "
+                        f"{len(df)} < {self.cfg.lookback}"
+                    )
+                    self.data_fail[symbol] = self.data_fail.get(symbol, 0) + 1
+                    if self.data_fail[symbol] >= 2:
+                        self.ex._bad_cache[symbol] = time.time()
+                    continue
+                self.data_fail[symbol] = 0
                 d  = compute_indicators(df, self.cfg)
-                if len(d) < 2: continue
+                if len(d) < 2:
+                    print(
+                        f"[WARN] insufficient indicator data for {symbol}: "
+                        f"{len(d)} < 2"
+                    )
+                    continue
 
                 last = d.iloc[-1]
                 closed = self.paper.update_with_candle(symbol, float(last["high"]), float(last["low"]), last.name)
@@ -1020,6 +1083,25 @@ class Bot:
             except Exception:
                 continue
 
+        # Force-close trades that have been open for more than 24h
+        now = now_utc()
+        max_age = dt.timedelta(hours=24)
+        for tid, t in list(self.paper.open.items()):
+            opened = pd.to_datetime(t.timestamp)
+            if now - opened > max_age:
+                price = self.ex.fetch_ticker_price(t.symbol)
+                if price is None:
+                    continue
+                mkt = self.ex.x.market(t.symbol)
+                contract_size = float(mkt.get("contractSize") or 1)
+                contract_qty = t.qty / contract_size
+                contract_qty = float(self.ex.x.amount_to_precision(t.symbol, contract_qty))
+                self.ex.close_position(t.symbol, t.side, contract_qty)
+                closed_t = self.paper.force_close(t, price, reason="timeout")
+                self.paper.persist_closed([closed_t], self.cfg, "timeout")
+                self.closed_trades.append(closed_t)
+                self.notifier.send(f"[FORCE-CLOSE] {t.symbol} after 24h")
+
         self._maybe_hourly_report()
 
         # لو في صفقات مفتوحة — نكتفي بتتبع الإغلاق فقط
@@ -1034,8 +1116,23 @@ class Bot:
             try:
 
                 df = self.ex.fetch_ohlcv(symbol, self.cfg.timeframe, limit=self.cfg.lookback)
+                if len(df) < self.cfg.lookback:
+                    print(
+                        f"[WARN] insufficient OHLCV for {symbol}: "
+                        f"{len(df)} < {self.cfg.lookback}"
+                    )
+                    self.data_fail[symbol] = self.data_fail.get(symbol, 0) + 1
+                    if self.data_fail[symbol] >= 2:
+                        self.ex._bad_cache[symbol] = time.time()
+                    continue
+                self.data_fail[symbol] = 0
                 d  = compute_indicators(df, self.cfg)
-                if len(d) < 3: continue
+                if len(d) < 3:
+                    print(
+                        f"[WARN] insufficient indicator data for {symbol}: "
+                        f"{len(d)} < 3"
+                    )
+                    continue
 
                 row = d.iloc[-2]
                 regime = classify_regime(row, self.cfg)
