@@ -362,36 +362,42 @@ class FuturesExchange:
         return df.dropna()
 
     def fetch_ohlcv_paged(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-        """
-        Fetch OHLCV data in multiple requests to bypass the 300-candle limit on OKX.
-        Useful for demo accounts that enforce a per-call maximum.
+        """Fetch ``limit`` candles even when the exchange caps results at 300 per call.
+
+        The previous implementation attempted to page forward using the last
+        candle's timestamp, which returned only the most recent batch.  Here we
+        page **forward in time** starting from ``limit`` bars ago so the final
+        DataFrame always contains up to ``limit`` rows ordered chronologically.
         """
         max_per_call = 300
+        tf_ms = self.x.parse_timeframe(timeframe) * 1000
+        end = self.x.milliseconds()
+        since = end - limit * tf_ms
         out = []
-        since = None
-        remaining = int(limit)
-        while remaining > 0:
-            batch = min(remaining, max_per_call)
+        while len(out) < limit:
+            batch = min(max_per_call, limit - len(out))
             try:
-                ohlcv = self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=batch, since=since)
+                ohlcv = self.x.fetch_ohlcv(
+                    symbol, timeframe=timeframe, since=since, limit=batch
+                )
             except Exception as e:
                 print(f"[WARN] fetch_ohlcv failed for {symbol}: {e}")
                 break
             if not ohlcv:
                 break
             out.extend(ohlcv)
+            since = ohlcv[-1][0] + tf_ms
             if len(ohlcv) < batch:
                 break
-            last_ts = int(ohlcv[-1][0])
-            since = last_ts + 1
-            remaining -= len(ohlcv)
             time.sleep(0.05)
         if not out:
-            return pd.DataFrame(columns=["open","high","low","close","volume"]).astype(float)
-        df = pd.DataFrame(out, columns=["timestamp","open","high","low","close","volume"])
+            cols = ["open", "high", "low", "close", "volume"]
+            return pd.DataFrame(columns=cols).astype(float)
+        df = pd.DataFrame(out, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        df = df.set_index("datetime").drop(columns=["timestamp"]).apply(pd.to_numeric, errors="coerce").dropna()
-        return df.sort_index()
+        df = df.set_index("datetime").drop(columns=["timestamp"])
+        df = df.apply(pd.to_numeric, errors="coerce").dropna()
+        return df.tail(limit)
 
     def fetch_ticker_price(self, symbol: str) -> Optional[float]:
         """Fetch the latest trade price for a symbol."""
