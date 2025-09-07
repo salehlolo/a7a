@@ -164,6 +164,34 @@ class Config:
     scalp_sl_atr_mult: float = 0.8
     debug_signals: bool = True   # كان False، فعّله افتراضيًا للتشخيص
 
+    # ===== MVP Strategy (HTF trend + pullback) =====
+    strategy_enable_mvp: bool = True
+    mvp_base_tf: str = "30m"
+    mvp_htf: str = "2h"
+    mvp_ema_fast: int = 9
+    mvp_ema_slow: int = 21
+    mvp_rsi_len: int = 14
+    mvp_rsi_buy_min: float = 45.0
+    mvp_rsi_buy_max: float = 60.0
+    mvp_rsi_sell_min: float = 40.0
+    mvp_rsi_sell_max: float = 55.0
+    mvp_atr_len: int = 14
+    mvp_sl_atr_mult: float = 1.2
+    mvp_tp_atr_mult: float = 1.8
+    mvp_big_candle_mult: float = 2.0
+
+    # ===== MVP Risk / Filters =====
+    risk_per_trade_pct: float = 1.0
+    risk_max_concurrent_trades: int = 3
+    risk_daily_loss_stop_R: float = -3.0
+    max_spread_bps: float = 5.0
+    max_funding_pct: float = 0.03
+    htf_new_candle_cooldown_min: int = 5
+    min_rr_required: Optional[float] = 1.4
+    atr_overheat_ratio: float = 0.6
+    secondary_use_bb_rsi: bool = False
+    trace_entries: bool = True
+
     # Filters
     funding_filter: bool = True
     max_abs_funding: float = 0.003
@@ -852,6 +880,72 @@ def sig_scalp(symbol: str, row: pd.Series, cfg: Config) -> Optional[Tuple[str, s
     )
     return (side.lower(), reason, quality, filter_scale)
 
+# ===== MVP Strategy =====
+def sig_mvp(symbol: str, df: pd.DataFrame, cfg: Config, ex: "FuturesExchange") -> Optional[Tuple[str,str,float,float]]:
+    row = df.iloc[-2]
+    atr = safe_float(row.get("atr", np.nan))
+    if np.isnan(atr) or atr <= 0:
+        return None
+    body = abs(row["close"] - row["open"])
+    if body > cfg.mvp_big_candle_mult * atr:
+        return None
+    try:
+        htf = ex.fetch_ohlcv_paged(symbol, cfg.mvp_htf, limit=cfg.mvp_ema_slow + 5)
+        htf["ema_fast"] = htf["close"].ewm(span=cfg.mvp_ema_fast, adjust=False).mean()
+        htf["ema_slow"] = htf["close"].ewm(span=cfg.mvp_ema_slow, adjust=False).mean()
+    except Exception:
+        return None
+    trend_up = htf["ema_fast"].iloc[-1] > htf["ema_slow"].iloc[-1]
+    trend_dn = htf["ema_fast"].iloc[-1] < htf["ema_slow"].iloc[-1]
+    htf_last = htf.index[-1]
+    if now_utc() < htf_last + dt.timedelta(minutes=cfg.htf_new_candle_cooldown_min):
+        return None
+    rsi_val = float(row.get("rsi", np.nan))
+    ema21 = float(row.get("ema_slow", np.nan))
+    if trend_up:
+        if not (cfg.mvp_rsi_buy_min <= rsi_val <= cfg.mvp_rsi_buy_max):
+            return None
+        if not (row["low"] <= ema21 and row["close"] > ema21):
+            return None
+        side = "buy"
+    elif trend_dn:
+        if not (cfg.mvp_rsi_sell_min <= rsi_val <= cfg.mvp_rsi_sell_max):
+            return None
+        if not (row["high"] >= ema21 and row["close"] < ema21):
+            return None
+        side = "sell"
+    else:
+        return None
+    try:
+        tkr = ex.x.fetch_ticker(symbol)
+        bid = safe_float(tkr.get("bid"))
+        ask = safe_float(tkr.get("ask"))
+        if bid and ask and ask > bid:
+            spread = (ask - bid) / ((ask + bid) / 2)
+            if spread > cfg.max_spread_bps / 10000:
+                return None
+    except Exception:
+        pass
+    if cfg.max_funding_pct and hasattr(ex.x, "fetch_funding_rate"):
+        try:
+            fr = ex.x.fetch_funding_rate(symbol)
+            fr_val = safe_float(fr.get("fundingRate", 0.0))
+            if side == "buy" and fr_val > cfg.max_funding_pct / 100:
+                return None
+            if side == "sell" and -fr_val > cfg.max_funding_pct / 100:
+                return None
+        except Exception:
+            pass
+    rr = cfg.mvp_tp_atr_mult / cfg.mvp_sl_atr_mult if cfg.mvp_sl_atr_mult else None
+    if cfg.min_rr_required is not None and rr is not None and rr < cfg.min_rr_required:
+        return None
+    if cfg.atr_overheat_ratio:
+        atr_ma = df["atr"].rolling(50).mean().iloc[-2]
+        if atr_ma > 0 and atr > atr_ma * (1 + cfg.atr_overheat_ratio):
+            return None
+    reason = "MVP_EMA_PULLBACK"
+    return (side, reason, 1.0, 1.0)
+
 def ctx_key(regime: Regime) -> str:
     return f"{regime.trend}|{regime.vol_bucket}"
 # =========================
@@ -1140,6 +1234,7 @@ class Bot:
         self.load_model_state()
         self.last_hourly_report = now_utc()
         self.last_daily_report_date = now_utc().date()
+        self.daily_R = 0.0
 
     def _maybe_hourly_report(self):
         now = now_utc()
@@ -1184,6 +1279,7 @@ class Bot:
         if today != self.last_daily_report_date:
             self._send_daily_report(self.last_daily_report_date)
             self.last_daily_report_date = today
+            self.daily_R = 0.0
 
     def load_model_state(self) -> None:
         """Load model-performance weights from ``state.json``.
@@ -1317,6 +1413,9 @@ class Bot:
                     for t in closed:
                         pnl_sum += float(t.pnl_usd or 0.0)
                         if t.result == "sl": sl_count += 1
+                        risk_usd = abs(t.entry - t.sl) * t.qty
+                        if risk_usd > 0:
+                            self.daily_R += (t.pnl_usd or 0.0) / risk_usd
                         emoji = "✅" if t.result=="tp" else "❌"
                         hold_s = int((pd.to_datetime(t.exit_time)-pd.to_datetime(t.timestamp)).total_seconds())
                         self.notifier.send(
@@ -1358,6 +1457,8 @@ class Bot:
 
         # هدوء أحداث أو ثروتل
         if not self.can_alert_now(): return
+        if self.daily_R <= self.cfg.risk_daily_loss_stop_R:
+            return
 
         # البحث عن إشارة جديدة
         for symbol in self.symbols:
@@ -1391,11 +1492,12 @@ class Bot:
                     )
                 regime = classify_regime(row, self.cfg)
 
-                # Determine if SCALP conditions are met
-                sig_info = self._committee(symbol, row, regime)
+                if self.cfg.strategy_enable_mvp:
+                    sig_info = sig_mvp(symbol, d, self.cfg, self.ex)
+                else:
+                    sig_info = self._committee(symbol, row, regime)
                 if not sig_info:
                     continue
-
                 side, reason, quality, filter_scale = sig_info
 
                 # Use live ticker price for entry to avoid stale candles
@@ -1404,7 +1506,8 @@ class Bot:
                     continue
 
                 tp, sl = get_tp_sl(price, side, row, self.cfg)
-                sig = Signal(side, sl, tp, "SCALP", reason)
+                model_name = "MVP" if self.cfg.strategy_enable_mvp else "SCALP"
+                sig = Signal(side, sl, tp, model_name, reason)
 
                 # مانع تكرار نفس الإشارة
                 key = f"{symbol}:{self.cfg.timeframe}:{sig.model}:{sig.side}"
@@ -1414,38 +1517,40 @@ class Bot:
 
                 bal = float(self.ex.get_balance_usdt())
                 lev = max(1.0, float(self.cfg.leverage_x))
-                max_slots = max(1, int(self.cfg.max_open_trades))
-
-                total_capital = bal * float(self.cfg.capital_pct)
                 open_trades = list(self.paper.open.values())
                 open_cnt = _count_open_trades(open_trades)
-                used_capital = _used_capital_usdt(open_trades)
-                remaining_slots = max(1, max_slots - open_cnt)
-
-                if self.cfg.equal_split_mode and not self.cfg.dynamic_split_mode:
-                    per_trade_capital = total_capital / max_slots
+                if self.cfg.strategy_enable_mvp:
+                    if open_cnt >= self.cfg.risk_max_concurrent_trades:
+                        continue
+                    per_trade_capital = bal * (self.cfg.risk_per_trade_pct / 100.0)
+                    target_notional = max(0.0, per_trade_capital) * lev
                 else:
-                    rem_cap = max(0.0, total_capital - used_capital)
-                    per_trade_capital = rem_cap / remaining_slots if remaining_slots > 0 else 0.0
-
-                target_notional = max(0.0, per_trade_capital) * lev
-                if filter_scale != 1.0:
-                    target_notional *= filter_scale
-                    if self.cfg.debug_signals:
-                        print(f"[FILTER] {symbol} scale={filter_scale:.2f} target_notional={target_notional:.2f}")
-                if self.cfg.quality_sizing:
-                    q = max(0.0, min(1.0, quality))
-                    lo_q = float(self.cfg.min_quality)
-                    if q <= lo_q:
-                        scale = float(self.cfg.size_scale_low)
+                    max_slots = max(1, int(self.cfg.max_open_trades))
+                    total_capital = bal * float(self.cfg.capital_pct)
+                    used_capital = _used_capital_usdt(open_trades)
+                    remaining_slots = max(1, max_slots - open_cnt)
+                    if self.cfg.equal_split_mode and not self.cfg.dynamic_split_mode:
+                        per_trade_capital = total_capital / max_slots
                     else:
-                        t = (q - lo_q) / (1.0 - lo_q)
-                        scale = float(self.cfg.size_scale_low) + t * (float(self.cfg.size_scale_high) - float(self.cfg.size_scale_low))
-                    target_notional *= max(0.0, scale)
-                    if self.cfg.debug_signals:
-                        print(f"[QUAL] {symbol} scale={scale:.2f} target_notional={target_notional:.2f}")
-                target_notional = max(float(self.cfg.min_notional),
-                                      min(float(self.cfg.max_notional), target_notional))
+                        rem_cap = max(0.0, total_capital - used_capital)
+                        per_trade_capital = rem_cap / remaining_slots if remaining_slots > 0 else 0.0
+                    target_notional = max(0.0, per_trade_capital) * lev
+                    if filter_scale != 1.0:
+                        target_notional *= filter_scale
+                        if self.cfg.debug_signals:
+                            print(f"[FILTER] {symbol} scale={filter_scale:.2f} target_notional={target_notional:.2f}")
+                    if self.cfg.quality_sizing:
+                        q = max(0.0, min(1.0, quality))
+                        lo_q = float(self.cfg.min_quality)
+                        if q <= lo_q:
+                            scale = float(self.cfg.size_scale_low)
+                        else:
+                            t = (q - lo_q) / (1.0 - lo_q)
+                            scale = float(self.cfg.size_scale_low) + t * (float(self.cfg.size_scale_high) - float(self.cfg.size_scale_low))
+                        target_notional *= max(0.0, scale)
+                        if self.cfg.debug_signals:
+                            print(f"[QUAL] {symbol} scale={scale:.2f} target_notional={target_notional:.2f}")
+                target_notional = max(float(self.cfg.min_notional), min(float(self.cfg.max_notional), target_notional))
 
                 mkt = self.ex.x.market(symbol)
                 contract_size = float(mkt.get("contractSize") or 1.0)
@@ -1520,6 +1625,7 @@ def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Evolving Committee Scalper (Alerts Only) — No OpenAI")
     p.add_argument("--timeframe", default="30m")
     p.add_argument("--lookback", type=int, default=None)
+    p.add_argument("--mvp-off", action="store_true", help="disable MVP strategy")
     p.add_argument("--no-debug", action="store_true")            # لإطفاء الديباج عند الحاجة
     p.add_argument("--no-funding-filter", action="store_true")   # لتعطيل فلتر الفاندنغ مؤقتًا
     p.add_argument("--quiet", nargs="*", default=None, help="UTC HH:MM times to avoid (e.g., 12:30 18:00)")
@@ -1554,6 +1660,8 @@ def parse_args() -> Config:
     cfg.okx_demo = not args.live
     if args.lookback is not None:
         cfg.lookback = int(args.lookback)
+    if args.mvp_off:
+        cfg.strategy_enable_mvp = False
     if args.no_debug:
         cfg.debug_signals = False
     if args.no_funding_filter:
