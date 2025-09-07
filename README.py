@@ -16,7 +16,7 @@ import os, time, json, argparse, datetime as dt, math
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, List, Dict
 
-import numpy as np
+import numpy as np  # مطلوب لحسابات بسيطة بالفلتر
 import pandas as pd
 
 try:
@@ -28,14 +28,6 @@ except Exception:
 import ccxt
 import ta
 import requests
-
-# =========================
-# Constants
-# =========================
-
-# Each trade uses 90% of the account balance at 10× leverage
-LEVERAGE = 10
-BALANCE_FRACTION = 0.9
 
 # =========================
 # Helpers
@@ -61,13 +53,62 @@ def safe_float(x, default=np.nan):
 def pct(n): return f"{n*100:.2f}%"
 
 # =========================
+# Capital/Leverage Helpers
+# =========================
+
+def _count_open_trades(open_trades) -> int:
+    try:
+        return max(0, int(len(open_trades or [])))
+    except Exception:
+        return 0
+
+def _used_capital_usdt(open_trades) -> float:
+    """Compute total notional (USDT) across open trades."""
+    tot = 0.0
+    for t in (open_trades or []):
+        try:
+            if isinstance(t, dict):
+                tot += float(t.get("notional", 0.0))
+            else:
+                tot += float(getattr(t, "notional", 0.0))
+        except Exception:
+            pass
+    return tot
+
+# =========================
 # Config
 # =========================
 
 @dataclass
 class Config:
     timeframe: str = "30m"
-    lookback: int = 800
+    lookback: int = 300
+
+    # ===== Default Risk Settings (updated) =====
+    leverage_x: float = 10.0      # ثابت X10
+    capital_pct: float = 0.90     # 90% من رأس المال
+    max_open_trades: int = 3          # الحد الأقصى للصفقات المتزامنة
+    equal_split_mode: bool = False    # تقسيم ثابت (True) أم ديناميكي (False)
+    dynamic_split_mode: bool = True   # تقسيم ديناميكي للمتبقي على الخانات المتبقية
+    min_notional: float = 10.0        # حد أدنى للقيمة الإسمية للصفقة
+    max_notional: float = 1_000_000.0 # حد أقصى للقيمة الإسمية (أمان)
+
+    # ===== Filters & Quality Sizing =====
+    filters_enabled: bool = True       # فلترة الإشارات
+    trend_filter: bool = True          # فلتر اتجاه
+    min_atr_pct: float = 0.15          # كان 0.20 → لِين بسيط
+    min_vol_z: float = 0.20            # كان 0.50 → يسمح بسيولة متوسطة
+    min_vol_pct_alt: float = 0.40      # حد بديل: الحجم ضمن أعلى 40% من نطاقه المحلي
+    # أوضاع الفلترة: strict | any | kofn | soft
+    filter_mode: str = "kofn"          # الافتراضي: 2 من 3 يمرّ
+    filters_k: int = 2                 # k-of-n
+    # لـ soft: تصغير/تكبير حجم الصفقة بدل الحظر
+    soft_scale_low: float = 0.70
+    soft_scale_high: float = 1.00
+    quality_sizing: bool = True        # ربط الحجم بجودة الإشارة
+    min_quality: float = 0.35          # أقل جودة مسموح بها
+    size_scale_low: float = 0.60       # معامل التصغير عند الجودة الدنيا المقبولة
+    size_scale_high: float = 1.30      # معامل التكبير عند الجودة العالية
 
     # Indicators / windows
     ema_fast: int = 9
@@ -121,11 +162,35 @@ class Config:
     scalp_rsi_sell: float = 60.0
     scalp_tp_atr_mult: float = 1.2
     scalp_sl_atr_mult: float = 0.8
-    scalp_bb_k: float = 2.0
-    debug_signals: bool = False
+    debug_signals: bool = True   # كان False، فعّله افتراضيًا للتشخيص
 
-    # Sizing
-    max_open_trades: int = 1
+    # ===== MVP Strategy (HTF trend + pullback) =====
+    strategy_enable_mvp: bool = True
+    mvp_base_tf: str = "30m"
+    mvp_htf: str = "2h"
+    mvp_ema_fast: int = 9
+    mvp_ema_slow: int = 21
+    mvp_rsi_len: int = 14
+    mvp_rsi_buy_min: float = 45.0
+    mvp_rsi_buy_max: float = 60.0
+    mvp_rsi_sell_min: float = 40.0
+    mvp_rsi_sell_max: float = 55.0
+    mvp_atr_len: int = 14
+    mvp_sl_atr_mult: float = 1.2
+    mvp_tp_atr_mult: float = 1.8
+    mvp_big_candle_mult: float = 2.0
+
+    # ===== MVP Risk / Filters =====
+    risk_per_trade_pct: float = 1.0
+    risk_max_concurrent_trades: int = 3
+    risk_daily_loss_stop_R: float = -3.0
+    max_spread_bps: float = 5.0
+    max_funding_pct: float = 0.03
+    htf_new_candle_cooldown_min: int = 5
+    min_rr_required: Optional[float] = 1.4
+    atr_overheat_ratio: float = 0.6
+    secondary_use_bb_rsi: bool = False
+    trace_entries: bool = True
 
     # Filters
     funding_filter: bool = True
@@ -256,7 +321,7 @@ class FuturesExchange:
         # Determine account modes for proper order parameters
         self.pos_mode = "net"        # "net" أو "long_short"
         self.margin_mode = "cross"   # "cross" أو "isolated"
-        self.leverage = LEVERAGE
+        self.leverage = float(cfg.leverage_x)
         try:
             info = self.x.privateGetAccountConfig()
             data = info.get("data", [])
@@ -324,6 +389,44 @@ class FuturesExchange:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         return df.dropna()
 
+    def fetch_ohlcv_paged(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+        """Fetch ``limit`` candles even when the exchange caps results at 300 per call.
+
+        The previous implementation attempted to page forward using the last
+        candle's timestamp, which returned only the most recent batch.  Here we
+        page **forward in time** starting from ``limit`` bars ago so the final
+        DataFrame always contains up to ``limit`` rows ordered chronologically.
+        """
+        max_per_call = 300
+        tf_ms = self.x.parse_timeframe(timeframe) * 1000
+        end = self.x.milliseconds()
+        since = end - limit * tf_ms
+        out = []
+        while len(out) < limit:
+            batch = min(max_per_call, limit - len(out))
+            try:
+                ohlcv = self.x.fetch_ohlcv(
+                    symbol, timeframe=timeframe, since=since, limit=batch
+                )
+            except Exception as e:
+                print(f"[WARN] fetch_ohlcv failed for {symbol}: {e}")
+                break
+            if not ohlcv:
+                break
+            out.extend(ohlcv)
+            since = ohlcv[-1][0] + tf_ms
+            if len(ohlcv) < batch:
+                break
+            time.sleep(0.05)
+        if not out:
+            cols = ["open", "high", "low", "close", "volume"]
+            return pd.DataFrame(columns=cols).astype(float)
+        df = pd.DataFrame(out, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df = df.set_index("datetime").drop(columns=["timestamp"])
+        df = df.apply(pd.to_numeric, errors="coerce").dropna()
+        return df.tail(limit)
+
     def fetch_ticker_price(self, symbol: str) -> Optional[float]:
         """Fetch the latest trade price for a symbol."""
         try:
@@ -367,8 +470,17 @@ class FuturesExchange:
                 print("[WARN] create_order returned no id:", o)
                 return None
             return o
+        except ccxt.InsufficientFunds:
+            bal = self.get_balance_usdt()
+            print(f"[WARN] insufficient USDT margin: available {bal:.2f} — skipping order for {symbol}")
+            return None
         except Exception as e:
-            print("[WARN] create_order failed:", e)
+            msg = str(e)
+            if "Insufficient" in msg and "margin" in msg:
+                bal = self.get_balance_usdt()
+                print(f"[WARN] insufficient USDT margin ({bal:.2f} available): {msg}")
+            else:
+                print("[WARN] create_order failed:", msg)
             return None
 
     def close_position(self, symbol: str, orig_side: str, contract_amt: float):
@@ -433,16 +545,25 @@ class FuturesExchange:
             if nowt - last_ok < self.cfg.health_refresh_minutes*60:
                 ok.append(s); continue
             try:
-                _ = self.fetch_ohlcv(s, self.cfg.timeframe, limit=self.cfg.health_test_limit)
-                if _.shape[0] > 10:
-                    ok.append(s); self._health_cache[s] = nowt
+                _ = self.fetch_ohlcv_paged(s, self.cfg.timeframe, limit=self.cfg.lookback)
+                if _.shape[0] >= self.cfg.lookback:
+                    ok.append(s)
+                    self._health_cache[s] = nowt
                 else:
+                    print(
+                        f"[WARN] insufficient history for {s}: "
+                        f"{_.shape[0]} < {self.cfg.lookback}"
+                    )
                     self._bad_cache[s] = nowt
             except Exception:
                 self._bad_cache[s] = nowt
             time.sleep(0.05)
         if not ok:
-            ok = ["BTC/USDT:USDT","ETH/USDT:USDT"]
+            fallback = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+            for s in fallback:
+                last_bad = self._bad_cache.get(s, 0)
+                if nowt - last_bad >= self.cfg.health_refresh_minutes * 60:
+                    ok.append(s)
         return ok
 
 # =========================
@@ -452,26 +573,41 @@ class FuturesExchange:
 def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     d = df.copy()
 
-    d["ema9"]  = ta.trend.EMAIndicator(d["close"], window=cfg.ema_fast).ema_indicator()
-    d["ema21"] = ta.trend.EMAIndicator(d["close"], window=cfg.ema_slow).ema_indicator()
+    d["ema_fast"] = ta.trend.EMAIndicator(d["close"], window=cfg.ema_fast).ema_indicator()
+    d["ema_slow"] = ta.trend.EMAIndicator(d["close"], window=cfg.ema_slow).ema_indicator()
+    d["ema9"]  = d["ema_fast"]
+    d["ema21"] = d["ema_slow"]
 
     d["rsi"] = ta.momentum.RSIIndicator(d["close"], window=cfg.rsi_len).rsi()
 
-    bb = ta.volatility.BollingerBands(d["close"], window=cfg.bb_len, window_dev=cfg.scalp_bb_k)
+    bb = ta.volatility.BollingerBands(d["close"], window=cfg.bb_len, window_dev=cfg.bb_std)
     d["bb_mid"], d["bb_up"], d["bb_dn"] = bb.bollinger_mavg(), bb.bollinger_hband(), bb.bollinger_lband()
 
     atr = ta.volatility.AverageTrueRange(d["high"], d["low"], d["close"], window=cfg.atr_window)
     d["atr"] = atr.average_true_range()
-    d["atr_pct"] = d["atr"] / d["close"]
+    atr_ma_win = max(10, int(cfg.atr_window * 3))
+    d["atr_ma"] = d["atr"].rolling(atr_ma_win, min_periods=atr_ma_win//2).mean()
+    d["atr_pct"] = d["atr"] / d["atr_ma"]
 
     session = d.index.tz_convert("UTC").normalize()
     d["vwap_num"] = (d["close"] * d["volume"]).groupby(session).cumsum()
     d["vwap_den"] = d["volume"].groupby(session).cumsum().replace(0, np.nan)
     d["vwap"] = d["vwap_num"] / d["vwap_den"]
 
-    d["vol_ma"] = d["volume"].rolling(cfg.vol_ma_len).mean()
-    d["vol_spike"] = d["volume"] > (d["vol_ma"] * cfg.trend_vol_mult)
-    d["bo_vol_spike"] = d["volume"] > (d["vol_ma"] * cfg.bo_vol_mult)
+    vol_ma = d["volume"].rolling(cfg.vol_ma_len, min_periods=cfg.vol_ma_len//2).mean()
+    vol_std = d["volume"].rolling(cfg.vol_ma_len, min_periods=cfg.vol_ma_len//2).std()
+    d["vol_ma"] = vol_ma
+    d["vol_z"] = (d["volume"] - vol_ma) / vol_std.replace(0, np.nan)
+
+    # بديل للسيولة: نسبة الحجم داخل نطاقه المحلي (0..1)
+    _w = max(10, int(cfg.vol_ma_len))
+    vmin = d["volume"].rolling(_w, min_periods=_w//2).min()
+    vmax = d["volume"].rolling(_w, min_periods=_w//2).max()
+    vrng = (vmax - vmin).replace(0, np.nan)
+    d["vol_pct"] = (d["volume"] - vmin) / vrng
+
+    d["vol_spike"] = d["volume"] > (vol_ma * cfg.trend_vol_mult)
+    d["bo_vol_spike"] = d["volume"] > (vol_ma * cfg.bo_vol_mult)
 
     d["recent_high"] = d["high"].rolling(cfg.box_len).max()
     d["recent_low"]  = d["low"].rolling(cfg.box_len).min()
@@ -501,6 +637,84 @@ def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     d = d.replace([np.inf, -np.inf], np.nan).dropna()
     return d
+
+# =============== Filters Engine (k-of-n / soft) ===============
+def eval_filters(side: str, row: pd.Series, cfg: Config,
+                 px: float, bb_lo: float, bb_hi: float, rsi: float) -> Tuple[bool, Dict[str, bool], float]:
+    """Evaluate liquidity, ATR and trend filters.
+
+    Returns:
+        passed (bool): decision for strict/any/kofn (always True for soft)
+        mask (dict): individual results for liq/atr/trend
+        score (float): fraction of passed filters, used for soft scaling
+    """
+    vol_z = float(row.get("vol_z", -10.0))
+    vol_pct = float(row.get("vol_pct", -1.0))
+    pass_liq = (vol_z >= cfg.min_vol_z) or (vol_pct >= cfg.min_vol_pct_alt)
+
+    atr_pct = float(row.get("atr_pct", 0.0))
+    pass_atr = atr_pct >= cfg.min_atr_pct
+
+    ema_fast = float(row.get("ema_fast", np.nan))
+    ema_slow = float(row.get("ema_slow", np.nan))
+    pass_trend = True
+    if cfg.trend_filter:
+        band_w = max(1e-9, float(bb_hi - bb_lo))
+        touch_buy = float(np.clip((bb_lo + 0.10 * band_w - px) / band_w, 0.0, 1.0))
+        touch_sell = float(np.clip((px - (bb_hi - 0.10 * band_w)) / band_w, 0.0, 1.0))
+        rsi_buy_extreme = rsi <= max(25.0, getattr(cfg, "scalp_rsi_buy", 40.0) - 5.0)
+        rsi_sell_extreme = rsi >= min(75.0, getattr(cfg, "scalp_rsi_sell", 60.0) + 5.0)
+        allow_ct_buy = rsi_buy_extreme and (touch_buy >= 0.25)
+        allow_ct_sell = rsi_sell_extreme and (touch_sell >= 0.25)
+        if side == "BUY":
+            pass_trend = (ema_fast > ema_slow) or allow_ct_buy
+        else:
+            pass_trend = (ema_fast < ema_slow) or allow_ct_sell
+
+    mask = {"liq": pass_liq, "atr": pass_atr, "trend": pass_trend}
+    n_pass = sum(1 for v in mask.values() if v)
+    n_total = len(mask)
+    score = n_pass / n_total if n_total else 0.0
+
+    mode = (cfg.filter_mode or "kofn").lower()
+    if mode == "strict":
+        return (n_pass == n_total, mask, score)
+    if mode == "any":
+        return (n_pass >= 1, mask, score)
+    if mode == "kofn":
+        k = max(1, int(cfg.filters_k))
+        return (n_pass >= k, mask, score)
+    if mode == "soft":
+        return (True, mask, score)
+    return (n_pass == n_total, mask, score)
+
+# =========================
+# Quality Scoring
+# =========================
+def score_signal(side: str, row: pd.Series, cfg: Config) -> float:
+    px = float(row["close"])
+    bb_lo = float(row.get("bb_dn", np.nan))
+    bb_hi = float(row.get("bb_up", np.nan))
+    rsi   = float(row.get("rsi", np.nan))
+    atr_pct = float(row.get("atr_pct", 0.0))
+    vol_z   = float(row.get("vol_z", -10.0))
+    ema_fast = float(row.get("ema_fast", np.nan))
+    ema_slow = float(row.get("ema_slow", np.nan))
+    if any([np.isnan(v) for v in [bb_lo, bb_hi, rsi, ema_fast, ema_slow]]):
+        return 0.0
+    band_w = max(1e-12, bb_hi - bb_lo)
+    if side == "BUY":
+        band_score = np.clip((bb_lo + (band_w * 0.15) - px) / band_w, 0.0, 1.0)
+        rsi_score  = np.clip((45.0 - rsi) / 45.0, 0.0, 1.0)
+        trend_score = 1.0 if ema_fast > ema_slow else 0.0
+    else:
+        band_score = np.clip((px - (bb_hi - (band_w * 0.15))) / band_w, 0.0, 1.0)
+        rsi_score  = np.clip((rsi - 55.0) / 45.0, 0.0, 1.0)
+        trend_score = 1.0 if ema_fast < ema_slow else 0.0
+    atr_score = np.clip(atr_pct / 1.5, 0.0, 1.0)
+    vol_score = np.clip((vol_z - 0.0) / 2.0, 0.0, 1.0)
+    q = (0.30*band_score + 0.20*rsi_score + 0.20*atr_score + 0.15*vol_score + 0.15*trend_score)
+    return float(np.clip(q, 0.0, 1.0))
 
 # =========================
 # Regime
@@ -566,27 +780,171 @@ def get_tp_sl(entry: float, side: str, row: pd.Series, cfg: Config) -> Tuple[flo
     else:
         return make_tp_sl(entry, side, cfg)
 
+# ====== Strategy: SCALP (BB + RSI) ======
+def bbands(close: pd.Series, n: int = 20, k: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    ma = close.rolling(n).mean()
+    sd = close.rolling(n).std(ddof=0)
+    upper = ma + k * sd
+    lower = ma - k * sd
+    return lower, ma, upper
+
+def rsi(close: pd.Series, n: int = 14) -> pd.Series:
+    delta = close.diff()
+    up = delta.clip(lower=0.0)
+    dn = -delta.clip(upper=0.0)
+    ma_up = up.ewm(alpha=1 / n, adjust=False).mean()
+    ma_dn = dn.ewm(alpha=1 / n, adjust=False).mean()
+    rs = ma_up / (ma_dn.replace(0, np.nan))
+    return 100 - (100 / (1 + rs))
+
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+def strat(df: pd.DataFrame):
+    if len(df) < 40:
+        return None
+    a = atr(df, 14).iloc[-1]
+    if np.isnan(a) or a <= 0:
+        return None
+    lo, _, hi = bbands(df["close"], n=20, k=2.0)
+    bb_lo = float(lo.iloc[-1])
+    bb_hi = float(hi.iloc[-1])
+    r = float(rsi(df["close"], n=14).iloc[-1])
+    px = float(df["close"].iloc[-1])
+    tp, sl = 1.2 * a, 0.8 * a
+    if px <= bb_lo and r <= 40:
+        return ("buy", px - sl, px + tp, f"SCALP: px<=BBlo & RSI={r:.1f}")
+    if px >= bb_hi and r >= 60:
+        return ("sell", px + sl, px - tp, f"SCALP: px>=BBhi & RSI={r:.1f}")
+    return None
+
 # SCALP strategy (BB + RSI)
 # =========================
 
-def sig_scalp(row: pd.Series, cfg: Config) -> Optional[Tuple[str, str]]:
-    """Determine SCALP trade direction based on Bollinger and RSI."""
-    a = safe_float(row.get("atr", np.nan))
-    if np.isnan(a) or a <= 0:
-        if cfg.debug_signals:
-            print("[DEBUG] SCALP skip: invalid ATR")
-        return None
-    price = float(row["close"])
+def sig_scalp(symbol: str, row: pd.Series, cfg: Config) -> Optional[Tuple[str, str, float, float]]:
+    """SCALP logic with flexible filters."""
+    atr = safe_float(row.get("atr", np.nan))
+    px = float(row["close"])
     bb_lo = float(row["bb_dn"])
     bb_hi = float(row["bb_up"])
-    r = float(row["rsi"])
-    if price <= bb_lo and r <= cfg.scalp_rsi_buy:
-        return ("buy", f"SCALP: px<=BBlo & RSI={r:.1f}")
-    if price >= bb_hi and r >= cfg.scalp_rsi_sell:
-        return ("sell", f"SCALP: px>=BBhi & RSI={r:.1f}")
+    rsi_val = float(row["rsi"])
+
     if cfg.debug_signals:
-        print(f"[DEBUG] SCALP skip: px={price:.4f} bb_lo={bb_lo:.4f} bb_hi={bb_hi:.4f} rsi={r:.2f}")
-    return None
+        print(f"[DEBUG] SCALP inputs: px={px:.4f} bb_lo={bb_lo:.4f} bb_hi={bb_hi:.4f} rsi={rsi_val:.2f} atr={atr:.4f}")
+
+    if np.isnan(atr) or atr <= 0:
+        if cfg.debug_signals:
+            print(f"[DEBUG] SCALP skip: invalid ATR={atr}")
+        return None
+
+    buy_cond  = (px <= bb_lo) and (rsi_val <= cfg.scalp_rsi_buy) and (atr > 0)
+    sell_cond = (px >= bb_hi) and (rsi_val >= cfg.scalp_rsi_sell) and (atr > 0)
+
+    filter_scale = 1.0
+    if cfg.filters_enabled and (buy_cond or sell_cond):
+        side = "BUY" if buy_cond else "SELL"
+        passed, mask, score = eval_filters(side, row, cfg, px, bb_lo, bb_hi, rsi_val)
+        mode = (cfg.filter_mode or "kofn").lower()
+        if mode in ("strict", "any", "kofn"):
+            if not passed:
+                if cfg.debug_signals:
+                    print(f"[FILTER] {symbol} BLOCK mode={mode} mask={mask} score={score:.2f}")
+                buy_cond = sell_cond = False
+        else:
+            lo = float(cfg.soft_scale_low)
+            hi = float(cfg.soft_scale_high)
+            filter_scale = float(np.clip(lo + (hi - lo) * score, lo, hi))
+            if cfg.debug_signals:
+                print(f"[FILTER] {symbol} SOFT scale={filter_scale:.2f} mask={mask} score={score:.2f}")
+
+    side = "BUY" if buy_cond else ("SELL" if sell_cond else None)
+    if side is None:
+        if cfg.debug_signals:
+            print(f"[DEBUG] SCALP skip: px={px:.4f} bb_lo={bb_lo:.4f} bb_hi={bb_hi:.4f} rsi={rsi_val:.2f} atr={atr:.4f}")
+        return None
+
+    quality = score_signal(side, row, cfg)
+    if cfg.debug_signals:
+        print(f"[QUAL] {symbol} side={side} q={quality:.2f}")
+    if quality < float(cfg.min_quality):
+        if cfg.debug_signals:
+            print(f"[QUAL] {symbol} skip: q<{cfg.min_quality}")
+        return None
+
+    reason = (
+        f"SCALP: px<=BBlo & RSI={rsi_val:.1f}" if side == "BUY" else f"SCALP: px>=BBhi & RSI={rsi_val:.1f}"
+    )
+    return (side.lower(), reason, quality, filter_scale)
+
+# ===== MVP Strategy =====
+def sig_mvp(symbol: str, df: pd.DataFrame, cfg: Config, ex: "FuturesExchange") -> Optional[Tuple[str,str,float,float]]:
+    row = df.iloc[-2]
+    atr = safe_float(row.get("atr", np.nan))
+    if np.isnan(atr) or atr <= 0:
+        return None
+    body = abs(row["close"] - row["open"])
+    if body > cfg.mvp_big_candle_mult * atr:
+        return None
+    try:
+        htf = ex.fetch_ohlcv_paged(symbol, cfg.mvp_htf, limit=cfg.mvp_ema_slow + 5)
+        htf["ema_fast"] = htf["close"].ewm(span=cfg.mvp_ema_fast, adjust=False).mean()
+        htf["ema_slow"] = htf["close"].ewm(span=cfg.mvp_ema_slow, adjust=False).mean()
+    except Exception:
+        return None
+    trend_up = htf["ema_fast"].iloc[-1] > htf["ema_slow"].iloc[-1]
+    trend_dn = htf["ema_fast"].iloc[-1] < htf["ema_slow"].iloc[-1]
+    htf_last = htf.index[-1]
+    if now_utc() < htf_last + dt.timedelta(minutes=cfg.htf_new_candle_cooldown_min):
+        return None
+    rsi_val = float(row.get("rsi", np.nan))
+    ema21 = float(row.get("ema_slow", np.nan))
+    if trend_up:
+        if not (cfg.mvp_rsi_buy_min <= rsi_val <= cfg.mvp_rsi_buy_max):
+            return None
+        if not (row["low"] <= ema21 and row["close"] > ema21):
+            return None
+        side = "buy"
+    elif trend_dn:
+        if not (cfg.mvp_rsi_sell_min <= rsi_val <= cfg.mvp_rsi_sell_max):
+            return None
+        if not (row["high"] >= ema21 and row["close"] < ema21):
+            return None
+        side = "sell"
+    else:
+        return None
+    try:
+        tkr = ex.x.fetch_ticker(symbol)
+        bid = safe_float(tkr.get("bid"))
+        ask = safe_float(tkr.get("ask"))
+        if bid and ask and ask > bid:
+            spread = (ask - bid) / ((ask + bid) / 2)
+            if spread > cfg.max_spread_bps / 10000:
+                return None
+    except Exception:
+        pass
+    if cfg.max_funding_pct and hasattr(ex.x, "fetch_funding_rate"):
+        try:
+            fr = ex.x.fetch_funding_rate(symbol)
+            fr_val = safe_float(fr.get("fundingRate", 0.0))
+            if side == "buy" and fr_val > cfg.max_funding_pct / 100:
+                return None
+            if side == "sell" and -fr_val > cfg.max_funding_pct / 100:
+                return None
+        except Exception:
+            pass
+    rr = cfg.mvp_tp_atr_mult / cfg.mvp_sl_atr_mult if cfg.mvp_sl_atr_mult else None
+    if cfg.min_rr_required is not None and rr is not None and rr < cfg.min_rr_required:
+        return None
+    if cfg.atr_overheat_ratio:
+        atr_ma = df["atr"].rolling(50).mean().iloc[-2]
+        if atr_ma > 0 and atr > atr_ma * (1 + cfg.atr_overheat_ratio):
+            return None
+    reason = "MVP_EMA_PULLBACK"
+    return (side, reason, 1.0, 1.0)
 
 def ctx_key(regime: Regime) -> str:
     return f"{regime.trend}|{regime.vol_bucket}"
@@ -607,6 +965,7 @@ class PaperTrade:
     tp: float
     model: str
     qty: float
+    notional: float
     status: str = "open"
     exit_price: Optional[float] = None
     exit_time: Optional[str] = None
@@ -642,10 +1001,12 @@ class Paper:
 
     def _gen_id(self) -> str: return f"T{int(time.time()*1000)}"
 
-    def open_virtual(self, symbol: str, price: float, sig: Signal, qty: float, cfg: Config) -> PaperTrade:
+    def open_virtual(self, symbol: str, price: float, sig: Signal, qty: float,
+                     notional: float, cfg: Config) -> PaperTrade:
         t = PaperTrade(
             id=self._gen_id(), timestamp=fmt_ts(), symbol=symbol, timeframe=cfg.timeframe,
-            side=sig.side, entry=price, sl=float(sig.sl), tp=float(sig.tp), model=sig.model, qty=qty
+            side=sig.side, entry=price, sl=float(sig.sl), tp=float(sig.tp),
+            model=sig.model, qty=qty, notional=notional
         )
         self.open[t.id] = t
         return t
@@ -683,6 +1044,28 @@ class Paper:
         for k in to_close:
             self.open.pop(k, None)
         return closed
+
+    def force_close(self, trade: PaperTrade, price: float, reason: str = "timeout") -> PaperTrade:
+        """Forcefully close an open trade at the given ``price``.
+
+        Parameters
+        ----------
+        trade: PaperTrade
+            The trade to close.
+        price: float
+            The price at which the trade is closed.
+        reason: str
+            Label to store in ``trade.result`` describing why the trade was
+            closed (default: ``"timeout"``).
+        """
+        trade.status = "closed"
+        trade.result = reason
+        trade.exit_price = float(price)
+        trade.exit_time = fmt_ts()
+        pnl = (trade.exit_price - trade.entry) * trade.qty * (1 if trade.side == "buy" else -1)
+        trade.pnl_usd = round(pnl, 4)
+        self.open.pop(trade.id, None)
+        return trade
 
     def persist_closed(self, closed: List[PaperTrade], cfg: Config, ctx: str):
         if not closed: return
@@ -846,10 +1229,12 @@ class Bot:
         self.last_time: Dict[str, Optional[dt.datetime]] = {}
         self.last_alert_ts: float = 0.0
         self.closed_trades: List[PaperTrade] = []
+        self.data_fail: Dict[str, int] = {}
         self.model_state: Dict[str, dict] = {}
         self.load_model_state()
         self.last_hourly_report = now_utc()
         self.last_daily_report_date = now_utc().date()
+        self.daily_R = 0.0
 
     def _maybe_hourly_report(self):
         now = now_utc()
@@ -894,6 +1279,7 @@ class Bot:
         if today != self.last_daily_report_date:
             self._send_daily_report(self.last_daily_report_date)
             self.last_daily_report_date = today
+            self.daily_R = 0.0
 
     def load_model_state(self) -> None:
         """Load model-performance weights from ``state.json``.
@@ -958,8 +1344,8 @@ class Bot:
     def can_alert_now(self) -> bool:
         return (time.time() - self.last_alert_ts) >= self.cfg.min_seconds_between_alerts_global
 
-    def _committee(self, symbol: str, row: pd.Series, regime: Regime) -> Optional[Tuple[str, str]]:
-        return sig_scalp(row, self.cfg)
+    def _committee(self, symbol: str, row: pd.Series, regime: Regime) -> Optional[Tuple[str, str, float, float]]:
+        return sig_scalp(symbol, row, self.cfg)
 
     def run(self):
         self.notifier.send(f"[START] Evolving Scalper | TOP {self.cfg.top_n_symbols} | TF {self.cfg.timeframe} | RefEq={self.ref_equity:.2f} USDT")
@@ -982,11 +1368,32 @@ class Bot:
         # تحديث إغلاقات الصفقات (حتى أثناء الوقف/التهدئة)
         for symbol in self.symbols:
             try:
-                df = self.ex.fetch_ohlcv(symbol, self.cfg.timeframe, limit=self.cfg.lookback)
+                df = self.ex.fetch_ohlcv_paged(symbol, self.cfg.timeframe, limit=self.cfg.lookback)
+                if len(df) < self.cfg.lookback:
+                    print(
+                        f"[WARN] insufficient OHLCV for {symbol}: "
+                        f"{len(df)} < {self.cfg.lookback}"
+                    )
+                    self.data_fail[symbol] = self.data_fail.get(symbol, 0) + 1
+                    if self.data_fail[symbol] >= 2:
+                        self.ex._bad_cache[symbol] = time.time()
+                    continue
+                self.data_fail[symbol] = 0
                 d  = compute_indicators(df, self.cfg)
-                if len(d) < 2: continue
+                if len(d) < 2:
+                    print(
+                        f"[WARN] insufficient indicator data for {symbol}: "
+                        f"{len(d)} < 2"
+                    )
+                    continue
 
                 last = d.iloc[-1]
+                if self.cfg.debug_signals:
+                    print(
+                        f"[DBG][{symbol}] len={len(d)} last.close={last['close']:.6f} "
+                        f"rsi={last['rsi']:.2f} bb_dn={last['bb_dn']:.6f} "
+                        f"bb_up={last['bb_up']:.6f} atr={last['atr']:.6f}"
+                    )
                 closed = self.paper.update_with_candle(symbol, float(last["high"]), float(last["low"]), last.name)
                 if closed:
                     for t in closed:
@@ -1006,6 +1413,9 @@ class Bot:
                     for t in closed:
                         pnl_sum += float(t.pnl_usd or 0.0)
                         if t.result == "sl": sl_count += 1
+                        risk_usd = abs(t.entry - t.sl) * t.qty
+                        if risk_usd > 0:
+                            self.daily_R += (t.pnl_usd or 0.0) / risk_usd
                         emoji = "✅" if t.result=="tp" else "❌"
                         hold_s = int((pd.to_datetime(t.exit_time)-pd.to_datetime(t.timestamp)).total_seconds())
                         self.notifier.send(
@@ -1020,6 +1430,25 @@ class Bot:
             except Exception:
                 continue
 
+        # Force-close trades that have been open for more than 24h
+        now = now_utc()
+        max_age = dt.timedelta(hours=24)
+        for tid, t in list(self.paper.open.items()):
+            opened = pd.to_datetime(t.timestamp)
+            if now - opened > max_age:
+                price = self.ex.fetch_ticker_price(t.symbol)
+                if price is None:
+                    continue
+                mkt = self.ex.x.market(t.symbol)
+                contract_size = float(mkt.get("contractSize") or 1)
+                contract_qty = t.qty / contract_size
+                contract_qty = float(self.ex.x.amount_to_precision(t.symbol, contract_qty))
+                self.ex.close_position(t.symbol, t.side, contract_qty)
+                closed_t = self.paper.force_close(t, price, reason="timeout")
+                self.paper.persist_closed([closed_t], self.cfg, "timeout")
+                self.closed_trades.append(closed_t)
+                self.notifier.send(f"[FORCE-CLOSE] {t.symbol} after 24h")
+
         self._maybe_hourly_report()
 
         # لو في صفقات مفتوحة — نكتفي بتتبع الإغلاق فقط
@@ -1028,24 +1457,48 @@ class Bot:
 
         # هدوء أحداث أو ثروتل
         if not self.can_alert_now(): return
+        if self.daily_R <= self.cfg.risk_daily_loss_stop_R:
+            return
 
         # البحث عن إشارة جديدة
         for symbol in self.symbols:
             try:
 
-                df = self.ex.fetch_ohlcv(symbol, self.cfg.timeframe, limit=self.cfg.lookback)
+                df = self.ex.fetch_ohlcv_paged(symbol, self.cfg.timeframe, limit=self.cfg.lookback)
+                if len(df) < self.cfg.lookback:
+                    print(
+                        f"[WARN] insufficient OHLCV for {symbol}: "
+                        f"{len(df)} < {self.cfg.lookback}"
+                    )
+                    self.data_fail[symbol] = self.data_fail.get(symbol, 0) + 1
+                    if self.data_fail[symbol] >= 2:
+                        self.ex._bad_cache[symbol] = time.time()
+                    continue
+                self.data_fail[symbol] = 0
                 d  = compute_indicators(df, self.cfg)
-                if len(d) < 3: continue
-
-                row = d.iloc[-2]
-                regime = classify_regime(row, self.cfg)
-
-                # Determine if SCALP conditions are met
-                sig_info = self._committee(symbol, row, regime)
-                if not sig_info:
+                if len(d) < 3:
+                    print(
+                        f"[WARN] insufficient indicator data for {symbol}: "
+                        f"{len(d)} < 3"
+                    )
                     continue
 
-                side, reason = sig_info
+                row = d.iloc[-2]  # الشمعة المغلقة الأخيرة
+                if self.cfg.debug_signals:
+                    print(
+                        f"[DBG][{symbol}] prev.close={row['close']:.6f} rsi={row['rsi']:.2f} "
+                        f"in_band=({row['close']<=row['bb_dn']:.0f}/{row['close']>=row['bb_up']:.0f}) "
+                        f"atr={row['atr']:.6f}"
+                    )
+                regime = classify_regime(row, self.cfg)
+
+                if self.cfg.strategy_enable_mvp:
+                    sig_info = sig_mvp(symbol, d, self.cfg, self.ex)
+                else:
+                    sig_info = self._committee(symbol, row, regime)
+                if not sig_info:
+                    continue
+                side, reason, quality, filter_scale = sig_info
 
                 # Use live ticker price for entry to avoid stale candles
                 price = self.ex.fetch_ticker_price(symbol)
@@ -1053,7 +1506,8 @@ class Bot:
                     continue
 
                 tp, sl = get_tp_sl(price, side, row, self.cfg)
-                sig = Signal(side, sl, tp, "SCALP", reason)
+                model_name = "MVP" if self.cfg.strategy_enable_mvp else "SCALP"
+                sig = Signal(side, sl, tp, model_name, reason)
 
                 # مانع تكرار نفس الإشارة
                 key = f"{symbol}:{self.cfg.timeframe}:{sig.model}:{sig.side}"
@@ -1061,23 +1515,70 @@ class Bot:
                     if (now_utc() - self.last_time[symbol]).total_seconds()/60.0 < self.cfg.min_minutes_between_same_signal:
                         continue
 
-                bal = self.ex.get_balance_usdt()
-                notional_ref = bal * BALANCE_FRACTION * LEVERAGE
-                if notional_ref <= 0:
-                    print(f"[WARN] skipping {symbol}: balance {bal:.2f} USDT is too low")
+                bal = float(self.ex.get_balance_usdt())
+                lev = max(1.0, float(self.cfg.leverage_x))
+                open_trades = list(self.paper.open.values())
+                open_cnt = _count_open_trades(open_trades)
+                if self.cfg.strategy_enable_mvp:
+                    if open_cnt >= self.cfg.risk_max_concurrent_trades:
+                        continue
+                    per_trade_capital = bal * (self.cfg.risk_per_trade_pct / 100.0)
+                    target_notional = max(0.0, per_trade_capital) * lev
+                else:
+                    max_slots = max(1, int(self.cfg.max_open_trades))
+                    total_capital = bal * float(self.cfg.capital_pct)
+                    used_capital = _used_capital_usdt(open_trades)
+                    remaining_slots = max(1, max_slots - open_cnt)
+                    if self.cfg.equal_split_mode and not self.cfg.dynamic_split_mode:
+                        per_trade_capital = total_capital / max_slots
+                    else:
+                        rem_cap = max(0.0, total_capital - used_capital)
+                        per_trade_capital = rem_cap / remaining_slots if remaining_slots > 0 else 0.0
+                    target_notional = max(0.0, per_trade_capital) * lev
+                    if filter_scale != 1.0:
+                        target_notional *= filter_scale
+                        if self.cfg.debug_signals:
+                            print(f"[FILTER] {symbol} scale={filter_scale:.2f} target_notional={target_notional:.2f}")
+                    if self.cfg.quality_sizing:
+                        q = max(0.0, min(1.0, quality))
+                        lo_q = float(self.cfg.min_quality)
+                        if q <= lo_q:
+                            scale = float(self.cfg.size_scale_low)
+                        else:
+                            t = (q - lo_q) / (1.0 - lo_q)
+                            scale = float(self.cfg.size_scale_low) + t * (float(self.cfg.size_scale_high) - float(self.cfg.size_scale_low))
+                        target_notional *= max(0.0, scale)
+                        if self.cfg.debug_signals:
+                            print(f"[QUAL] {symbol} scale={scale:.2f} target_notional={target_notional:.2f}")
+                target_notional = max(float(self.cfg.min_notional), min(float(self.cfg.max_notional), target_notional))
+
+                mkt = self.ex.x.market(symbol)
+                contract_size = float(mkt.get("contractSize") or 1.0)
+                base_qty = target_notional / price
+                contract_qty = base_qty / contract_size
+                try:
+                    contract_qty = float(self.ex.x.amount_to_precision(symbol, contract_qty))
+                except Exception:
+                    contract_qty = float(contract_qty)
+
+                min_amt = float(((mkt.get("limits") or {}).get("amount") or {}).get("min") or 0.0)
+                if contract_qty < max(1e-9, min_amt):
+                    print(f"[WARN] {symbol} contract_qty < {max(1e-9, min_amt)} after precision — skipping")
                     continue
 
-                base_qty = notional_ref / price
-                mkt = self.ex.x.market(symbol)
-                contract_size = float(mkt.get("contractSize") or 1)
-                contract_qty = base_qty / contract_size
-                contract_qty = float(self.ex.x.amount_to_precision(symbol, contract_qty))
-                base_qty = contract_qty * contract_size
-                notional_ref = base_qty * price
-                req_margin = notional_ref / LEVERAGE
-                if bal < req_margin:
-                    print(f"[WARN] skipping {symbol}: need {req_margin:.2f} USDT but only {bal:.2f} available")
+                notional = contract_qty * contract_size * float(price)
+                req_margin = notional / lev
+                if req_margin > bal:
+                    print(f"[WARN] insufficient USDT margin: need {req_margin:.2f} > available {bal:.2f} — skipping {symbol}")
                     continue
+
+                if self.cfg.debug_signals:
+                    print(f"[RISK] {symbol} open={open_cnt}/{max_slots} rem={remaining_slots} used={used_capital:.2f} "
+                          f"total={total_capital:.2f} per={per_trade_capital:.2f} q={quality:.2f} "
+                          f"lev={lev:.1f} notional={notional:.2f} req_margin={req_margin:.2f} qty={contract_qty:.6f}")
+
+                base_qty = contract_qty * contract_size
+                notional_ref = notional
                 risk = abs(price - sig.sl); reward = abs(sig.tp - price)
                 rr = round(reward / risk, 2) if risk > 0 else None
 
@@ -1106,7 +1607,7 @@ class Bot:
                     self.last_time[symbol] = now_utc()
                     continue
 
-                t = self.paper.open_virtual(symbol, price, sig, base_qty, self.cfg)
+                t = self.paper.open_virtual(symbol, price, sig, base_qty, notional, self.cfg)
                 self.paper.ml_snapshot(t.id, symbol, row, regime)
 
                 self.last_key[symbol] = key
@@ -1123,16 +1624,78 @@ class Bot:
 def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Evolving Committee Scalper (Alerts Only) — No OpenAI")
     p.add_argument("--timeframe", default="30m")
+    p.add_argument("--lookback", type=int, default=None)
+    p.add_argument("--mvp-off", action="store_true", help="disable MVP strategy")
+    p.add_argument("--no-debug", action="store_true")            # لإطفاء الديباج عند الحاجة
+    p.add_argument("--no-funding-filter", action="store_true")   # لتعطيل فلتر الفاندنغ مؤقتًا
     p.add_argument("--quiet", nargs="*", default=None, help="UTC HH:MM times to avoid (e.g., 12:30 18:00)")
     p.add_argument("--top", type=int, default=None, help="Top N USDT perpetuals to scan (override config)")
     p.add_argument("--live", action="store_true", help="Use real trading environment instead of OKX demo")
+
+    # === CLI overrides for capital/leverage tool ===
+    p.add_argument("--leverage-x", type=float, default=None)   # تستطيع تغييره من CLI عند الحاجة
+    p.add_argument("--capital-pct", type=float, default=None)  # تستطيع تغييره من CLI عند الحاجة
+    p.add_argument("--max-open-trades", type=int, default=None, help="max concurrent trades (e.g., 3)")
+    p.add_argument("--equal-split", action="store_true", help="use equal split: total/slots")
+    p.add_argument("--dynamic-split", action="store_true", help="use dynamic split of remaining capital")
+    p.add_argument("--min-notional", type=float, default=None)
+    p.add_argument("--max-notional", type=float, default=None)
+    # ---- CLI: فلاتر/جودة ----
+    p.add_argument("--filters-off", action="store_true")
+    p.add_argument("--no-trend-filter", action="store_true")
+    p.add_argument("--min-atr-pct", type=float, default=None)
+    p.add_argument("--min-vol-z", type=float, default=None)
+    p.add_argument("--min-vol-pct-alt", type=float, default=None, help="volume percentile alt threshold (0..1)")
+    p.add_argument("--filter-mode", type=str, choices=["strict","any","kofn","soft"], default=None)
+    p.add_argument("--filters-k", type=int, default=None)
+    p.add_argument("--soft-scale-low", type=float, default=None)
+    p.add_argument("--soft-scale-high", type=float, default=None)
+    p.add_argument("--quality-sizing-off", action="store_true")
+    p.add_argument("--min-quality", type=float, default=None)
+    p.add_argument("--size-scale-low", type=float, default=None)
+    p.add_argument("--size-scale-high", type=float, default=None)
     args = p.parse_args()
     cfg = Config()
     cfg.timeframe = args.timeframe
     cfg.okx_demo = not args.live
+    if args.lookback is not None:
+        cfg.lookback = int(args.lookback)
+    if args.mvp_off:
+        cfg.strategy_enable_mvp = False
+    if args.no_debug:
+        cfg.debug_signals = False
+    if args.no_funding_filter:
+        cfg.funding_filter = False
+    # apply CLI overrides
+    if args.leverage_x is not None:       cfg.leverage_x = float(args.leverage_x)
+    if args.capital_pct is not None:      cfg.capital_pct = float(args.capital_pct)
+    if args.max_open_trades is not None:  cfg.max_open_trades = int(args.max_open_trades)
+    if args.equal_split:
+        cfg.equal_split_mode = True
+        cfg.dynamic_split_mode = False
+    if args.dynamic_split:
+        cfg.dynamic_split_mode = True
+    if args.min_notional is not None:     cfg.min_notional = float(args.min_notional)
+    if args.max_notional is not None:     cfg.max_notional = float(args.max_notional)
+    # تطبيق CLI: فلاتر/جودة
+    if args.filters_off:                  cfg.filters_enabled = False
+    if args.no_trend_filter:              cfg.trend_filter = False
+    if args.min_atr_pct is not None:      cfg.min_atr_pct = float(args.min_atr_pct)
+    if args.min_vol_z is not None:        cfg.min_vol_z = float(args.min_vol_z)
+    if args.min_vol_pct_alt is not None:  cfg.min_vol_pct_alt = float(args.min_vol_pct_alt)
+    if args.filter_mode is not None:      cfg.filter_mode = str(args.filter_mode)
+    if args.filters_k is not None:        cfg.filters_k = int(args.filters_k)
+    if args.soft_scale_low is not None:   cfg.soft_scale_low = float(args.soft_scale_low)
+    if args.soft_scale_high is not None:  cfg.soft_scale_high = float(args.soft_scale_high)
+    if args.quality_sizing_off:           cfg.quality_sizing = False
+    if args.min_quality is not None:      cfg.min_quality = float(args.min_quality)
+    if args.size_scale_low is not None:   cfg.size_scale_low = float(args.size_scale_low)
+    if args.size_scale_high is not None:  cfg.size_scale_high = float(args.size_scale_high)
     # اسمح بتجاوز الإعدادات من سطر الأوامر
-    if args.top is not None: cfg.top_n_symbols = int(args.top)
-    if args.quiet is not None: cfg.quiet_windows_utc = tuple(args.quiet)
+    if args.top is not None:
+        cfg.top_n_symbols = int(args.top)
+    if args.quiet is not None:
+        cfg.quiet_windows_utc = tuple(args.quiet)
     ensure_dir(cfg.logs_dir)
     ensure_dir(cfg.signals_csv); ensure_dir(cfg.trades_csv); ensure_dir(cfg.ml_csv); ensure_dir(cfg.models_csv)
     return cfg
